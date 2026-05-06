@@ -5,25 +5,21 @@ let session = {
   mode: "IDLE",
   startTime: null,
   duration: 0,
-  totalStartTime: null,
-  totalDuration: 0,
   focusDuration: 0,
   breakDuration: 0,
+  currentCycle: 0,
+  totalCycles: 0,
   warned5: false
 };
 
-const DEFAULT_TOTAL_MINUTES = 180;
 const DEFAULT_FOCUS_MINUTES = 50;
 const DEFAULT_BREAK_MINUTES = 10;
+const DEFAULT_CYCLES = 3;
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   // 🔹 START SESSION
   if (message.type === "START_SESSION") {
-    const totalMinutes =
-      Number.isFinite(message.data?.total) && message.data.total > 0
-        ? message.data.total
-        : DEFAULT_TOTAL_MINUTES;
     const focusMinutes =
       Number.isFinite(message.data?.focus) && message.data.focus > 0
         ? message.data.focus
@@ -32,14 +28,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       Number.isFinite(message.data?.break) && message.data.break > 0
         ? message.data.break
         : DEFAULT_BREAK_MINUTES;
+    const cycles =
+      Number.isFinite(message.data?.cycles) && message.data.cycles > 0
+        ? message.data.cycles
+        : DEFAULT_CYCLES;
 
     session.active = true;
     session.mode = "FOCUS";
     session.startTime = Date.now();
-    session.totalStartTime = session.startTime;
-    session.totalDuration = totalMinutes * 60 * 1000;
     session.focusDuration = focusMinutes * 60 * 1000;
     session.breakDuration = breakMinutes * 60 * 1000;
+    session.totalCycles = Math.floor(cycles);
+    session.currentCycle = 1;
     session.duration = session.focusDuration;
     session.warned5 = false;
 
@@ -52,10 +52,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     session.mode = "IDLE";
     session.startTime = null;
     session.duration = 0;
-    session.totalStartTime = null;
-    session.totalDuration = 0;
     session.focusDuration = 0;
     session.breakDuration = 0;
+    session.currentCycle = 0;
+    session.totalCycles = 0;
     session.warned5 = false;
 
     chrome.storage.local.remove(["allowedSites"], () => {
@@ -108,14 +108,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   else if (message.type === "GET_SESSION_STATE") {
     syncSessionState();
     const remaining = getRemainingTime();
-    const totalRemaining = getTotalRemainingTime();
+    const totalRemaining = getTotalRemainingTime(remaining);
 
     sendResponse({
       active: session.active,
       mode: session.mode,
       remaining,
       totalRemaining,
-      totalDuration: session.totalDuration,
+      currentCycle: session.currentCycle,
+      totalCycles: session.totalCycles,
       focusMinutes: session.focusDuration / 60 / 1000,
       breakMinutes: session.breakDuration / 60 / 1000
     });
@@ -174,15 +175,6 @@ function syncSessionState() {
     return;
   }
 
-  const totalElapsed = Date.now() - session.totalStartTime;
-
-  if (totalElapsed >= session.totalDuration) {
-    stopSessionState();
-    chrome.storage.local.remove(["allowedSites"]);
-    broadcast({ type: "SESSION_COMPLETE" });
-    return;
-  }
-
   const remaining = getRemainingTime();
 
   if (remaining <= 5000 && !session.warned5) {
@@ -204,6 +196,14 @@ function syncSessionState() {
     session.mode = "BREAK";
     session.duration = session.breakDuration;
   } else if (session.mode === "BREAK") {
+    if (session.currentCycle >= session.totalCycles) {
+      stopSessionState();
+      chrome.storage.local.remove(["allowedSites"]);
+      broadcast({ type: "SESSION_COMPLETE" });
+      return;
+    }
+
+    session.currentCycle++;
     session.mode = "FOCUS";
     session.duration = session.focusDuration;
   }
@@ -214,10 +214,10 @@ function stopSessionState() {
   session.mode = "IDLE";
   session.startTime = null;
   session.duration = 0;
-  session.totalStartTime = null;
-  session.totalDuration = 0;
   session.focusDuration = 0;
   session.breakDuration = 0;
+  session.currentCycle = 0;
+  session.totalCycles = 0;
   session.warned5 = false;
 }
 
@@ -247,10 +247,17 @@ function getRemainingTime() {
   return Math.max(session.duration - (Date.now() - session.startTime), 0);
 }
 
-function getTotalRemainingTime() {
-  if (!session.active || !session.totalStartTime) {
+function getTotalRemainingTime(currentRemaining) {
+  if (!session.active) {
     return 0;
   }
 
-  return Math.max(session.totalDuration - (Date.now() - session.totalStartTime), 0);
+  const focusBreakDuration = session.focusDuration + session.breakDuration;
+  const remainingFullCycles = Math.max(session.totalCycles - session.currentCycle, 0);
+
+  if (session.mode === "FOCUS") {
+    return currentRemaining + session.breakDuration + (remainingFullCycles * focusBreakDuration);
+  }
+
+  return currentRemaining + (remainingFullCycles * focusBreakDuration);
 }

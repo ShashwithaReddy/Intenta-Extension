@@ -1,7 +1,32 @@
 (function () {
   console.log("Intenta content loaded");
 
-  if (document.getElementById("intenta-widget")) return;
+  const hostId = "intenta-shadow-host";
+  if (document.getElementById(hostId)) return;
+
+  const host = document.createElement("div");
+  host.id = hostId;
+  document.documentElement.appendChild(host);
+
+  const shadow = host.attachShadow({ mode: "open" });
+  const style = document.createElement("style");
+  style.textContent = `
+    :host, * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+      font-family: Inter, system-ui, sans-serif !important;
+    }
+
+    button,
+    input {
+      font: inherit;
+      border: none;
+      outline: none;
+      appearance: none;
+    }
+  `;
+  shadow.appendChild(style);
 
   let sessionStateInterval = null;
   let audioCtx = null;
@@ -72,25 +97,40 @@
 
     overlay.style = `
       position: fixed;
-      top:0;left:0;width:100%;height:100%;
+      inset: 0;
       background: rgba(0,0,0,0.8);
-      z-index:999999;
-      display:flex;
-      align-items:center;
-      justify-content:center;
+      z-index: 2147483647;
+      display: flex;
+      align-items: center;
+      justify-content: center;
     `;
 
     overlay.innerHTML = `
-      <div style="background:#111;padding:24px;border-radius:10px;color:white;text-align:center;max-width:360px">
-        <p style="font-size:20px;font-weight:700;margin:0 0 16px">This site is not part of your focus session.</p>
-        <button id="add" style="margin-right:8px">Add to session</button>
+      <div style="
+        width: calc(100% - 32px);
+        max-width: 360px;
+        background: #111;
+        color: white;
+        padding: 24px;
+        border-radius: 10px;
+        text-align: center;
+        line-height: 1.4;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 12px;
+      ">
+        <p style="font-size:20px;font-weight:700;">This site is not part of your focus session.</p>
+        <button id="add">Add to session</button>
         <button id="back">Go back</button>
       </div>
     `;
 
-    document.body.appendChild(overlay);
+    shadow.appendChild(overlay);
+    styleOverlayButtons(overlay);
 
-    document.getElementById("add").onclick = () => {
+    shadow.getElementById("add").onclick = () => {
       safeSendMessage(
         {
           type: "ADD_TO_ALLOWED_SITES",
@@ -103,7 +143,7 @@
       );
     };
 
-    document.getElementById("back").onclick = () => {
+    shadow.getElementById("back").onclick = () => {
       window.history.back();
     };
   }
@@ -132,7 +172,7 @@
       z-index:999999;
     `;
 
-    document.body.appendChild(widget);
+    shadow.appendChild(widget);
 
     badge.id = "intenta-timer-badge";
     badge.style = `
@@ -150,14 +190,14 @@
       box-shadow: 0 4px 10px rgba(0,0,0,0.25);
     `;
 
-    document.body.appendChild(badge);
+    shadow.appendChild(badge);
 
     widget.onclick = togglePanel;
     startUpdates();
   }
 
   function togglePanel() {
-    let panel = document.getElementById("intenta-panel");
+    let panel = shadow.getElementById("intenta-panel");
 
     if (panel) {
       panel.remove();
@@ -167,47 +207,54 @@
     panel = document.createElement("div");
     panel.id = "intenta-panel";
 
-    panel.style = `
+    panel.style.cssText = `
       position: fixed;
-      bottom:80px;
-      right:20px;
-      background:#1a1a1a;
-      color:white;
-      padding:15px;
-      border-radius:10px;
-      z-index:999999;
-      width:200px;
+      bottom: 80px;
+      right: 20px;
+      width: 260px;
+      background: #111;
+      color: white;
+      padding: 16px;
+      border-radius: 12px;
+      z-index: 999999;
+      font-family: system-ui;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
     `;
 
     panel.innerHTML = `
       <div id="sessionStatus">
-        <div id="modeText">Mode: IDLE</div>
-        <div id="timeText">Remaining: --:--</div>
-        <div id="totalText">Total left: --:--:--</div>
+        <div id="cycleText" style="font-weight: 600;">Cycle: -- / --</div>
+        <div id="modeText" style="font-weight: 600;">Mode: IDLE</div>
+        <div id="timeText" style="font-weight: 600;">Remaining: --:--</div>
+        <div id="totalText" style="font-size: 12px; opacity: 0.7;">Total left: --:--:--</div>
       </div>
-      <div id="sessionConfig">
-        <input id="totalTime" placeholder="Total session (min)" />
+      <div id="session-config" style="margin-top:10px; display:flex; flex-direction:column; gap:8px;">
+        <input id="cycles" placeholder="Cycles" />
         <input id="focusTime" placeholder="Focus (min)" />
         <input id="breakTime" placeholder="Break (min)" />
         <button id="start">Start Session</button>
       </div>
+      <div style="margin-top:10px; border-top:1px solid #333;"></div>
       <button id="stop">Stop</button>
       <button id="tabs">Use Tabs</button>
     `;
 
-    document.body.appendChild(panel);
+    shadow.appendChild(panel);
+    stylePanelControls(panel);
 
-    document.getElementById("start").onclick = () => {
-      const total = Number(document.getElementById("totalTime").value);
-      const focus = Number(document.getElementById("focusTime").value);
-      const breakTime = Number(document.getElementById("breakTime").value);
+    shadow.getElementById("start").onclick = () => {
+      const cycles = Number(shadow.getElementById("cycles").value);
+      const focus = Number(shadow.getElementById("focusTime").value);
+      const breakTime = Number(shadow.getElementById("breakTime").value);
 
       safeSendMessage({
         type: "START_SESSION",
         data: {
-          total,
           focus,
-          break: breakTime
+          break: breakTime,
+          cycles
         }
       });
 
@@ -215,18 +262,72 @@
       startUpdates();
     };
 
-    document.getElementById("stop").onclick = () => {
+    shadow.getElementById("stop").onclick = () => {
       safeSendMessage({ type: "STOP_SESSION" });
       stopUpdates();
       render();
     };
 
-    document.getElementById("tabs").onclick = () => {
+    shadow.getElementById("tabs").onclick = () => {
       safeSendMessage({ type: "GET_TABS" });
     };
 
     render();
     startUpdates();
+  }
+
+  function stylePanelControls(panel) {
+    const inputStyle = `
+      width: 100%;
+      padding: 8px;
+      border-radius: 6px;
+      border: 1px solid #444;
+      background: #000;
+      color: white;
+      box-sizing: border-box;
+    `;
+    const buttonBaseStyle = `
+      width: 100%;
+      padding: 10px;
+      border-radius: 6px;
+      border: none;
+      cursor: pointer;
+      font-size: 14px;
+      font-weight: 500;
+      appearance: none;
+    `;
+
+    panel.querySelectorAll("input").forEach((input) => {
+      input.style.cssText = inputStyle;
+    });
+
+    const start = shadow.getElementById("start");
+    const stop = shadow.getElementById("stop");
+    const tabs = shadow.getElementById("tabs");
+
+    if (start) start.style.cssText = `${buttonBaseStyle} background: #22c55e; color: white;`;
+    if (stop) stop.style.cssText = `${buttonBaseStyle} background: #ef4444; color: white;`;
+    if (tabs) tabs.style.cssText = `${buttonBaseStyle} background: #222; color: white;`;
+  }
+
+  function styleOverlayButtons(container) {
+    const buttonBaseStyle = `
+      width: 100%;
+      padding: 10px;
+      border-radius: 6px;
+      border: none;
+      cursor: pointer;
+      font-size: 14px;
+      font-weight: 500;
+      appearance: none;
+    `;
+    const add = container.querySelector("#add");
+    const back = container.querySelector("#back");
+    const closeCelebration = container.querySelector("#closeCelebration");
+
+    if (add) add.style.cssText = `${buttonBaseStyle} background: #22c55e; color: white;`;
+    if (back) back.style.cssText = `${buttonBaseStyle} background: #222; color: white;`;
+    if (closeCelebration) closeCelebration.style.cssText = `${buttonBaseStyle} background: #22c55e; color: white;`;
   }
 
   function startUpdates() {
@@ -246,22 +347,32 @@
     safeSendMessage({ type: "GET_SESSION_STATE" }, (state) => {
       if (!state) return;
 
-      const modeText = document.getElementById("modeText");
-      const timeText = document.getElementById("timeText");
-      const totalText = document.getElementById("totalText");
-      const config = document.getElementById("sessionConfig");
-      const start = document.getElementById("start");
-      const badge = document.getElementById("intenta-timer-badge");
+      const cycleText = shadow.getElementById("cycleText");
+      const modeText = shadow.getElementById("modeText");
+      const timeText = shadow.getElementById("timeText");
+      const totalText = shadow.getElementById("totalText");
+      const config = shadow.getElementById("session-config");
+      const start = shadow.getElementById("start");
+      const stop = shadow.getElementById("stop");
+      const tabs = shadow.getElementById("tabs");
+      const badge = shadow.getElementById("intenta-timer-badge");
       const mode = state.active ? state.mode : "IDLE";
       const remaining = format(state.remaining);
       const totalRemaining = formatLong(state.totalRemaining || 0);
 
+      if (cycleText) {
+        cycleText.innerText = state.active
+          ? `Cycle: ${state.currentCycle} / ${state.totalCycles}`
+          : "Cycle: -- / --";
+      }
       if (modeText) modeText.innerText = "Mode: " + mode;
       if (timeText) timeText.innerText = "Remaining: " + remaining;
       if (totalText) totalText.innerText = "Total left: " + totalRemaining;
 
       if (config) config.style.display = state.active ? "none" : "block";
       if (start) start.style.display = state.active ? "none" : "";
+      if (stop) stop.style.display = state.active ? "" : "none";
+      if (tabs) tabs.style.display = state.active ? "" : "none";
 
       if (badge) {
         if (state.active) {
@@ -292,7 +403,7 @@
   }
 
   function showCelebrationOverlay() {
-    const existing = document.getElementById("intenta-celebration-overlay");
+    const existing = shadow.getElementById("intenta-celebration-overlay");
     if (existing) existing.remove();
 
     const overlay = document.createElement("div");
@@ -300,12 +411,9 @@
 
     overlay.style = `
       position: fixed;
-      top: 0;
-      left: 0;
-      width: 100%;
-      height: 100%;
+      inset: 0;
       background: rgba(0,0,0,0.85);
-      z-index: 1000003;
+      z-index: 2147483647;
       display: flex;
       align-items: center;
       justify-content: center;
@@ -313,12 +421,19 @@
 
     overlay.innerHTML = `
       <div style="
+        width: calc(100% - 32px);
         background: #111;
         color: white;
         padding: 32px;
         border-radius: 18px;
         text-align: center;
         max-width: 420px;
+        line-height: 1.4;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 12px;
         box-shadow: 0 20px 50px rgba(0,0,0,0.4);
       ">
         <div style="font-size: 42px;">🎉</div>
@@ -328,9 +443,10 @@
       </div>
     `;
 
-    document.body.appendChild(overlay);
+    shadow.appendChild(overlay);
+    styleOverlayButtons(overlay);
 
-    document.getElementById("closeCelebration").onclick = () => {
+    shadow.getElementById("closeCelebration").onclick = () => {
       overlay.remove();
     };
   }
