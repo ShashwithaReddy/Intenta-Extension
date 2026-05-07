@@ -168,6 +168,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     });
   }
 
+  // 🔹 CLEAR OVERLAYS IN ALL TABS
+  else if (message.type === "CLEAR_ALL_OVERLAYS") {
+    chrome.tabs.query({}, (tabs) => {
+      tabs.forEach((tab) => {
+        safeSendToTab(tab.id, {
+          type: "CLEAR_OVERLAYS"
+        });
+      });
+    });
+  }
+
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {

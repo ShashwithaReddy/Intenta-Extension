@@ -158,7 +158,12 @@
       showBlockedOverlay();
     }
 
+    if (message.type === "CLEAR_OVERLAYS") {
+      clearIntentaOverlays();
+    }
+
     if (message.type === "SESSION_COMPLETE") {
+      clearIntentaOverlays();
       showCelebrationOverlay();
       renderSessionState();
       stopSessionStateUpdates();
@@ -466,6 +471,7 @@
       const tabs = shadow.getElementById("tabs");
       const badge = shadow.getElementById("intenta-timer-badge");
       const isActive = Boolean(state && state.active);
+      const isFocus = isActive && state.mode === "FOCUS";
       const mode = isActive ? state.mode : "IDLE";
       const remaining = format(state.remaining);
       const totalRemaining = formatLong(state.totalRemaining || 0);
@@ -484,7 +490,7 @@
       if (config) config.style.display = isActive ? "none" : "flex";
       if (start) start.style.display = isActive ? "none" : "block";
       if (stop) stop.style.display = isActive ? "block" : "none";
-      if (tabs) tabs.style.display = isActive ? "block" : "none";
+      if (tabs) tabs.style.display = isFocus ? "block" : "none";
 
       if (badge) {
         if (isActive) {
@@ -501,6 +507,30 @@
   function removeBlockedOverlay() {
     const overlay = shadow.getElementById("intenta-block-overlay");
     if (overlay) overlay.remove();
+  }
+
+  function clearIntentaOverlays() {
+    console.log("Clearing overlays");
+
+    const selectors = [
+      "#intenta-block-overlay",
+      "#intenta-celebration-overlay",
+      "#intenta-panel",
+      "#intenta-toast"
+    ];
+
+    selectors.forEach((selector) => {
+      const el =
+        shadow.querySelector(selector) ||
+        document.querySelector(selector);
+
+      console.log("Removing:", selector, el);
+
+      if (el) {
+        console.log("Removing", selector);
+        el.remove();
+      }
+    });
   }
 
   function format(ms) {
@@ -563,13 +593,10 @@
     shadow.appendChild(overlay);
     styleOverlayButtons(overlay);
 
-    withButtonFeedback(
-      shadow.getElementById("closeCelebration"),
-      () => {
-        overlay.remove();
-      },
-      ""
-    );
+    const doneBtn = shadow.getElementById("closeCelebration");
+    doneBtn.addEventListener("click", () => {
+      safeSendMessage({ type: "CLEAR_ALL_OVERLAYS" });
+    });
   }
 
   function playSuccessSound() {
