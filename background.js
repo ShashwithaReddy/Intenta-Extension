@@ -170,6 +170,61 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 });
 
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.url || changeInfo.status === "complete") {
+    evaluateTab(tabId, tab.url);
+  }
+});
+
+chrome.tabs.onActivated.addListener((activeInfo) => {
+  chrome.tabs.get(activeInfo.tabId, (tab) => {
+    if (chrome.runtime.lastError || !tab) return;
+    evaluateTab(activeInfo.tabId, tab.url);
+  });
+});
+
+function evaluateTab(tabId, url) {
+  syncSessionState();
+
+  if (!session.active || session.mode !== "FOCUS") {
+    return;
+  }
+
+  if (!url || isUnsupportedUrl(url)) {
+    return;
+  }
+
+  if (url.includes("google.com/search")) {
+    return;
+  }
+
+  let domain;
+
+  try {
+    domain = new URL(url).hostname;
+  } catch {
+    return;
+  }
+
+  chrome.storage.local.get(["allowedSites"], (result) => {
+    const allowedSites = result.allowedSites || [];
+    const isAllowed = allowedSites.some(site => domain.includes(site));
+
+    if (!isAllowed) {
+      safeSendToTab(tabId, { type: "REALTIME_BLOCK" });
+    }
+  });
+}
+
+function isUnsupportedUrl(url) {
+  return (
+    url.startsWith("chrome://") ||
+    url.startsWith("chrome-extension://") ||
+    url.startsWith("edge://") ||
+    url.startsWith("about:")
+  );
+}
+
 function syncSessionState() {
   if (!session.active || !session.startTime || !session.duration) {
     return;

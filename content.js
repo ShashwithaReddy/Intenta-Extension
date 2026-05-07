@@ -154,6 +154,10 @@
       playCountdownTicks();
     }
 
+    if (message.type === "REALTIME_BLOCK") {
+      showBlockedOverlay();
+    }
+
     if (message.type === "SESSION_COMPLETE") {
       showCelebrationOverlay();
       renderSessionState();
