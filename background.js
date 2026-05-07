@@ -183,8 +183,10 @@ chrome.tabs.onActivated.addListener((activeInfo) => {
   });
 });
 
-function evaluateTab(tabId, url) {
-  syncSessionState();
+function evaluateTab(tabId, url, shouldSync = true) {
+  if (shouldSync) {
+    syncSessionState();
+  }
 
   if (!session.active || session.mode !== "FOCUS") {
     return;
@@ -213,6 +215,14 @@ function evaluateTab(tabId, url) {
     if (!isAllowed) {
       safeSendToTab(tabId, { type: "REALTIME_BLOCK" });
     }
+  });
+}
+
+function evaluateAllTabs() {
+  chrome.tabs.query({}, (tabs) => {
+    tabs.forEach((tab) => {
+      evaluateTab(tab.id, tab.url, false);
+    });
   });
 }
 
@@ -261,6 +271,7 @@ function syncSessionState() {
     session.currentCycle++;
     session.mode = "FOCUS";
     session.duration = session.focusDuration;
+    evaluateAllTabs();
   }
 }
 
