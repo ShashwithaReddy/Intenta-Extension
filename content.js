@@ -25,6 +25,25 @@
       outline: none;
       appearance: none;
     }
+
+    button {
+      transition: transform 120ms ease, opacity 120ms ease, background 120ms ease;
+    }
+
+    button:active {
+      transform: scale(0.96);
+    }
+
+    @keyframes intentaToastIn {
+      from {
+        opacity: 0;
+        transform: translateY(8px) scale(0.96);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0) scale(1);
+      }
+    }
   `;
   shadow.appendChild(style);
 
@@ -42,6 +61,74 @@
         if (callback) callback(response);
       });
     } catch {}
+  }
+
+  function sendMessageWithFallback(message) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const timeout = setTimeout(resolveOnce, 250);
+
+      function resolveOnce(response) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        resolve(response);
+      }
+
+      safeSendMessage(message, resolveOnce);
+    });
+  }
+
+  function withButtonFeedback(button, action, successText = "Done") {
+    button.addEventListener("click", async () => {
+      button.style.transform = "scale(0.96)";
+      button.style.opacity = "0.75";
+      button.disabled = true;
+
+      setTimeout(() => {
+        button.style.transform = "scale(1)";
+      }, 120);
+
+      try {
+        await action();
+        if (successText) showToast(successText);
+      } finally {
+        setTimeout(() => {
+          button.disabled = false;
+          button.style.opacity = "1";
+        }, 400);
+      }
+    });
+  }
+
+  function showToast(message) {
+    const existing = shadow.getElementById("intenta-toast");
+    if (existing) existing.remove();
+
+    const toast = document.createElement("div");
+    toast.id = "intenta-toast";
+    toast.textContent = message;
+
+    toast.style.cssText = `
+      position: fixed;
+      bottom: 150px;
+      right: 20px;
+      background: #111;
+      color: white;
+      padding: 10px 14px;
+      border-radius: 999px;
+      font-size: 13px;
+      font-weight: 600;
+      z-index: 2147483647;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+      animation: intentaToastIn 180ms ease-out;
+    `;
+
+    shadow.appendChild(toast);
+
+    setTimeout(() => {
+      toast.remove();
+    }, 1600);
   }
 
   function unlockAudio() {
@@ -69,8 +156,8 @@
 
     if (message.type === "SESSION_COMPLETE") {
       showCelebrationOverlay();
-      render();
-      stopUpdates();
+      renderSessionState();
+      stopSessionStateUpdates();
       playSuccessSound();
     }
   });
@@ -92,6 +179,16 @@
   );
 
   function showBlockedOverlay() {
+    safeSendMessage({ type: "GET_SESSION_STATE" }, (state) => {
+      if (!state?.active || state.mode !== "FOCUS") return;
+      renderBlockedOverlay();
+    });
+  }
+
+  function renderBlockedOverlay() {
+    const existing = shadow.getElementById("intenta-block-overlay");
+    if (existing) return;
+
     const overlay = document.createElement("div");
     overlay.id = "intenta-block-overlay";
 
@@ -130,22 +227,28 @@
     shadow.appendChild(overlay);
     styleOverlayButtons(overlay);
 
-    shadow.getElementById("add").onclick = () => {
-      safeSendMessage(
-        {
+    withButtonFeedback(
+      shadow.getElementById("add"),
+      async () => {
+        await sendMessageWithFallback({
           type: "ADD_TO_ALLOWED_SITES",
           data: { domain: window.location.hostname }
-        },
-        () => {
-          overlay.remove();
+        });
+        overlay.remove();
+        setTimeout(() => {
           window.location.reload();
-        }
-      );
-    };
+        }, 500);
+      },
+      "Site added to focus"
+    );
 
-    shadow.getElementById("back").onclick = () => {
-      window.history.back();
-    };
+    withButtonFeedback(
+      shadow.getElementById("back"),
+      () => {
+        window.history.back();
+      },
+      ""
+    );
   }
 
   createWidget();
@@ -193,7 +296,7 @@
     shadow.appendChild(badge);
 
     widget.onclick = togglePanel;
-    startUpdates();
+    startSessionStateUpdates();
   }
 
   function togglePanel() {
@@ -244,12 +347,12 @@
     shadow.appendChild(panel);
     stylePanelControls(panel);
 
-    shadow.getElementById("start").onclick = () => {
+    withButtonFeedback(shadow.getElementById("start"), async () => {
       const cycles = Number(shadow.getElementById("cycles").value);
       const focus = Number(shadow.getElementById("focusTime").value);
       const breakTime = Number(shadow.getElementById("breakTime").value);
 
-      safeSendMessage({
+      await sendMessageWithFallback({
         type: "START_SESSION",
         data: {
           focus,
@@ -258,22 +361,24 @@
         }
       });
 
-      render();
-      startUpdates();
-    };
+      renderSessionState();
+      startSessionStateUpdates();
+    }, "Session started");
 
-    shadow.getElementById("stop").onclick = () => {
-      safeSendMessage({ type: "STOP_SESSION" });
-      stopUpdates();
-      render();
-    };
+    withButtonFeedback(shadow.getElementById("stop"), async () => {
+      await sendMessageWithFallback({ type: "STOP_SESSION" });
+      renderSessionState();
+      stopSessionStateUpdates();
+    }, "Session stopped");
 
-    shadow.getElementById("tabs").onclick = () => {
-      safeSendMessage({ type: "GET_TABS" });
-    };
+    withButtonFeedback(
+      shadow.getElementById("tabs"),
+      () => sendMessageWithFallback({ type: "GET_TABS" }),
+      "Open tabs added to focus"
+    );
 
-    render();
-    startUpdates();
+    renderSessionState();
+    startSessionStateUpdates();
   }
 
   function stylePanelControls(panel) {
@@ -330,20 +435,20 @@
     if (closeCelebration) closeCelebration.style.cssText = `${buttonBaseStyle} background: #22c55e; color: white;`;
   }
 
-  function startUpdates() {
+  function startSessionStateUpdates() {
     if (sessionStateInterval) return;
 
-    sessionStateInterval = setInterval(render, 1000);
+    sessionStateInterval = setInterval(renderSessionState, 1000);
   }
 
-  function stopUpdates() {
+  function stopSessionStateUpdates() {
     if (!sessionStateInterval) return;
 
     clearInterval(sessionStateInterval);
     sessionStateInterval = null;
   }
 
-  function render() {
+  function renderSessionState() {
     safeSendMessage({ type: "GET_SESSION_STATE" }, (state) => {
       if (!state) return;
 
@@ -356,12 +461,13 @@
       const stop = shadow.getElementById("stop");
       const tabs = shadow.getElementById("tabs");
       const badge = shadow.getElementById("intenta-timer-badge");
-      const mode = state.active ? state.mode : "IDLE";
+      const isActive = Boolean(state && state.active);
+      const mode = isActive ? state.mode : "IDLE";
       const remaining = format(state.remaining);
       const totalRemaining = formatLong(state.totalRemaining || 0);
 
       if (cycleText) {
-        cycleText.innerText = state.active
+        cycleText.innerText = isActive
           ? `Cycle: ${state.currentCycle} / ${state.totalCycles}`
           : "Cycle: -- / --";
       }
@@ -369,13 +475,15 @@
       if (timeText) timeText.innerText = "Remaining: " + remaining;
       if (totalText) totalText.innerText = "Total left: " + totalRemaining;
 
-      if (config) config.style.display = state.active ? "none" : "block";
-      if (start) start.style.display = state.active ? "none" : "";
-      if (stop) stop.style.display = state.active ? "" : "none";
-      if (tabs) tabs.style.display = state.active ? "" : "none";
+      if (!isActive || state.mode === "BREAK") removeBlockedOverlay();
+
+      if (config) config.style.display = isActive ? "none" : "flex";
+      if (start) start.style.display = isActive ? "none" : "block";
+      if (stop) stop.style.display = isActive ? "block" : "none";
+      if (tabs) tabs.style.display = isActive ? "block" : "none";
 
       if (badge) {
-        if (state.active) {
+        if (isActive) {
           badge.innerText = `${state.mode} ${remaining}`;
           badge.style.background = state.mode === "BREAK" ? "#2563eb" : "#16a34a";
           badge.style.display = "block";
@@ -384,6 +492,11 @@
         }
       }
     });
+  }
+
+  function removeBlockedOverlay() {
+    const overlay = shadow.getElementById("intenta-block-overlay");
+    if (overlay) overlay.remove();
   }
 
   function format(ms) {
@@ -446,9 +559,13 @@
     shadow.appendChild(overlay);
     styleOverlayButtons(overlay);
 
-    shadow.getElementById("closeCelebration").onclick = () => {
-      overlay.remove();
-    };
+    withButtonFeedback(
+      shadow.getElementById("closeCelebration"),
+      () => {
+        overlay.remove();
+      },
+      ""
+    );
   }
 
   function playSuccessSound() {
