@@ -60,7 +60,14 @@
   let audioCtx = null;
   let audioUnlocked = false;
   let lastUrl = location.href;
-  let lastYouTubeIntervention = 0;
+  let youtubeInterventionState = {
+    HOME_FEED: {
+      suppressedUntil: 0
+    },
+    SHORTS: {
+      suppressedUntil: 0
+    }
+  };
 
   function detectYouTubePageType() {
     if (!location.hostname.includes("youtube.com")) {
@@ -196,22 +203,24 @@
   }
 
   function maybeShowYouTubeIntervention() {
-    const ytType = detectYouTubePageType();
+    const type = detectYouTubePageType();
 
-    if (ytType !== "HOME_FEED" && ytType !== "SHORTS") {
+    if (type !== "HOME_FEED" && type !== "SHORTS") {
       return;
     }
 
-    if (Date.now() - lastYouTubeIntervention <= 30000) {
+    const now = Date.now();
+
+    if (youtubeInterventionState[type]?.suppressedUntil > now) {
       return;
     }
 
     safeSendMessage({ type: "GET_SESSION_STATE" }, (state) => {
       if (!state?.active || state.mode !== "FOCUS") return;
-      if (Date.now() - lastYouTubeIntervention <= 30000) return;
+      if (youtubeInterventionState[type]?.suppressedUntil > Date.now()) return;
       if (shadow.getElementById("intenta-block-overlay")) return;
 
-      showYouTubeInterventionOverlay(ytType);
+      showYouTubeInterventionOverlay(type);
     });
   }
 
@@ -222,8 +231,6 @@
     ) {
       return;
     }
-
-    lastYouTubeIntervention = Date.now();
 
     const overlay = document.createElement("div");
     overlay.id = "intenta-youtube-overlay";
@@ -281,19 +288,26 @@
 
     if (searchButton) {
       searchButton.addEventListener("click", () => {
+        suppressYouTubeIntervention(type);
         focusYouTubeSearchInput();
         overlay.remove();
       });
     }
 
     continueButton.addEventListener("click", () => {
+      suppressYouTubeIntervention(type);
       overlay.remove();
     });
 
     leaveButton.addEventListener("click", () => {
+      youtubeInterventionState[type].suppressedUntil = 0;
       overlay.remove();
       window.history.back();
     });
+  }
+
+  function suppressYouTubeIntervention(type) {
+    youtubeInterventionState[type].suppressedUntil = Date.now() + 30000;
   }
 
   function focusYouTubeSearchInput() {
