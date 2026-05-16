@@ -63,10 +63,10 @@
     } catch {}
   }
 
-  function sendMessageWithFallback(message) {
+  function sendMessageWithFallback(message, timeoutMs = 250) {
     return new Promise((resolve) => {
       let settled = false;
-      const timeout = setTimeout(resolveOnce, 250);
+      const timeout = setTimeout(resolveOnce, timeoutMs);
 
       function resolveOnce(response) {
         if (settled) return;
@@ -164,7 +164,7 @@
 
     if (message.type === "SESSION_COMPLETE") {
       clearIntentaOverlays();
-      showCelebrationOverlay();
+      showCelebrationOverlay(message.summary);
       renderSessionState();
       stopSessionStateUpdates();
       playSuccessSound();
@@ -228,8 +228,8 @@
         gap: 12px;
       ">
         <p style="font-size:20px;font-weight:700;">This site is not part of your focus session.</p>
-        <button id="add">Add to session</button>
-        <button id="back">Go back</button>
+        <button id="add">Add to Focus</button>
+        <button id="back">Go Back</button>
       </div>
     `;
 
@@ -254,6 +254,8 @@
     withButtonFeedback(
       shadow.getElementById("back"),
       () => {
+        safeSendMessage({ type: "DISTRACTION_CLOSED" });
+        overlay.remove();
         window.history.back();
       },
       ""
@@ -351,6 +353,7 @@
       <div style="margin-top:10px; border-top:1px solid #333;"></div>
       <button id="stop">Stop</button>
       <button id="tabs">Use Tabs</button>
+      <button id="historyBtn">Session History</button>
     `;
 
     shadow.appendChild(panel);
@@ -386,6 +389,15 @@
       "Open tabs added to focus"
     );
 
+    withButtonFeedback(
+      shadow.getElementById("historyBtn"),
+      async () => {
+        const response = await sendMessageWithFallback({ type: "GET_SESSION_HISTORY" }, 1000);
+        showHistoryModal(response?.history || []);
+      },
+      ""
+    );
+
     renderSessionState();
     startSessionStateUpdates();
   }
@@ -418,10 +430,12 @@
     const start = shadow.getElementById("start");
     const stop = shadow.getElementById("stop");
     const tabs = shadow.getElementById("tabs");
+    const history = shadow.getElementById("historyBtn");
 
     if (start) start.style.cssText = `${buttonBaseStyle} background: #22c55e; color: white;`;
     if (stop) stop.style.cssText = `${buttonBaseStyle} background: #ef4444; color: white;`;
     if (tabs) tabs.style.cssText = `${buttonBaseStyle} background: #222; color: white;`;
+    if (history) history.style.cssText = `${buttonBaseStyle} background: #222; color: white;`;
   }
 
   function styleOverlayButtons(container) {
@@ -438,10 +452,14 @@
     const add = container.querySelector("#add");
     const back = container.querySelector("#back");
     const closeCelebration = container.querySelector("#closeCelebration");
+    const closeHistory = container.querySelector("#closeHistory");
+    const clearHistory = container.querySelector("#clearHistoryBtn");
 
     if (add) add.style.cssText = `${buttonBaseStyle} background: #22c55e; color: white;`;
     if (back) back.style.cssText = `${buttonBaseStyle} background: #222; color: white;`;
     if (closeCelebration) closeCelebration.style.cssText = `${buttonBaseStyle} background: #22c55e; color: white;`;
+    if (closeHistory) closeHistory.style.cssText = `${buttonBaseStyle} background: #22c55e; color: white;`;
+    if (clearHistory) clearHistory.style.cssText = `${buttonBaseStyle} background: #ef4444; color: white;`;
   }
 
   function startSessionStateUpdates() {
@@ -469,6 +487,7 @@
       const start = shadow.getElementById("start");
       const stop = shadow.getElementById("stop");
       const tabs = shadow.getElementById("tabs");
+      const history = shadow.getElementById("historyBtn");
       const badge = shadow.getElementById("intenta-timer-badge");
       const isActive = Boolean(state && state.active);
       const isFocus = isActive && state.mode === "FOCUS";
@@ -491,6 +510,7 @@
       if (start) start.style.display = isActive ? "none" : "block";
       if (stop) stop.style.display = isActive ? "block" : "none";
       if (tabs) tabs.style.display = isFocus ? "block" : "none";
+      if (history) history.style.display = isActive ? "none" : "block";
 
       if (badge) {
         if (isActive) {
@@ -515,6 +535,7 @@
     const selectors = [
       "#intenta-block-overlay",
       "#intenta-celebration-overlay",
+      "#intenta-history-modal",
       "#intenta-panel",
       "#intenta-toast"
     ];
@@ -549,7 +570,97 @@
     return `${hours}:${minutes}:${seconds}`;
   }
 
-  function showCelebrationOverlay() {
+  function showHistoryModal(history) {
+    const existing = shadow.getElementById("intenta-history-modal");
+    if (existing) existing.remove();
+
+    const overlay = document.createElement("div");
+    overlay.id = "intenta-history-modal";
+
+    overlay.style = `
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.75);
+      z-index: 2147483647;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+    `;
+
+    const listHtml = history.length
+      ? history.map((item) => `
+          <div style="
+            background: #181818;
+            border: 1px solid #333;
+            border-radius: 10px;
+            padding: 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+          ">
+            <div style="font-weight:700;">${item.cyclesCompleted || 0}/${item.totalCycles || 0} cycles • ${item.focusTimeFormatted || `${item.focusMinutes || 0} min`} focus</div>
+            <div style="font-size:12px;opacity:0.75;">Closed: ${item.distractionsClosed || 0} • Added: ${item.sitesAdded || 0}</div>
+            <div style="font-size:12px;opacity:0.6;">${formatHistoryDate(item.completedAt)}</div>
+          </div>
+        `).join("")
+      : `<div style="font-size:13px;opacity:0.75;text-align:center;">No sessions yet</div>`;
+
+    overlay.innerHTML = `
+      <div style="
+        width: calc(100% - 32px);
+        max-width: 420px;
+        max-height: 80vh;
+        overflow: auto;
+        background: #111;
+        color: white;
+        padding: 20px;
+        border-radius: 16px;
+        line-height: 1.4;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        box-shadow: 0 20px 50px rgba(0,0,0,0.4);
+      ">
+        <h2 style="font-size:18px;">Session History</h2>
+        <div style="display:flex;flex-direction:column;gap:10px;">${listHtml}</div>
+        ${history.length ? `<button id="clearHistoryBtn">Clear History</button>` : ""}
+        <button id="closeHistory">Close</button>
+      </div>
+    `;
+
+    shadow.appendChild(overlay);
+    styleOverlayButtons(overlay);
+
+    shadow.getElementById("closeHistory").addEventListener("click", () => {
+      overlay.remove();
+    });
+
+    const clearHistoryBtn = shadow.getElementById("clearHistoryBtn");
+
+    if (clearHistoryBtn) {
+      clearHistoryBtn.addEventListener("click", () => {
+        if (!confirm("Clear all session history?")) return;
+
+        safeSendMessage({ type: "CLEAR_SESSION_HISTORY" }, () => {
+          showHistoryModal([]);
+        });
+      });
+    }
+  }
+
+  function formatHistoryDate(value) {
+    if (!value) return "Unknown time";
+
+    return new Date(value).toLocaleString([], {
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit"
+    });
+  }
+
+  function showCelebrationOverlay(summary = {}) {
     const existing = shadow.getElementById("intenta-celebration-overlay");
     if (existing) existing.remove();
 
@@ -586,6 +697,24 @@
         <div style="font-size: 42px;">🎉</div>
         <h2>Session Complete</h2>
         <p>You showed up. You stayed intentional.</p>
+        <div style="
+          width: 100%;
+          background: #181818;
+          border: 1px solid #333;
+          border-radius: 12px;
+          padding: 14px;
+          display: flex;
+          flex-direction: column;
+          gap: 8px;
+          text-align: left;
+          font-size: 14px;
+        ">
+          <div><strong>Cycles:</strong> ${summary.cyclesCompleted || 0}/${summary.totalCycles || 0}</div>
+          <div><strong>Focus time:</strong> ${summary.focusTimeFormatted || `${summary.focusMinutes || 0} min`}</div>
+          <div><strong>Break time:</strong> ${summary.breakTimeFormatted || `${summary.breakMinutes || 0} min`}</div>
+          <div><strong>Distractions closed:</strong> ${summary.distractionsClosed || 0}</div>
+          <div><strong>Sites added to focus:</strong> ${summary.sitesAdded || 0}</div>
+        </div>
         <button id="closeCelebration">Done</button>
       </div>
     `;
