@@ -25,6 +25,25 @@
       outline: none;
       appearance: none;
     }
+
+    button {
+      transition: transform 120ms ease, opacity 120ms ease, background 120ms ease;
+    }
+
+    button:active {
+      transform: scale(0.96);
+    }
+
+    @keyframes intentaToastIn {
+      from {
+        opacity: 0;
+        transform: translateY(8px) scale(0.96);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0) scale(1);
+      }
+    }
   `;
   shadow.appendChild(style);
 
@@ -42,6 +61,74 @@
         if (callback) callback(response);
       });
     } catch {}
+  }
+
+  function sendMessageWithFallback(message, timeoutMs = 250) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const timeout = setTimeout(resolveOnce, timeoutMs);
+
+      function resolveOnce(response) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        resolve(response);
+      }
+
+      safeSendMessage(message, resolveOnce);
+    });
+  }
+
+  function withButtonFeedback(button, action, successText = "Done") {
+    button.addEventListener("click", async () => {
+      button.style.transform = "scale(0.96)";
+      button.style.opacity = "0.75";
+      button.disabled = true;
+
+      setTimeout(() => {
+        button.style.transform = "scale(1)";
+      }, 120);
+
+      try {
+        await action();
+        if (successText) showToast(successText);
+      } finally {
+        setTimeout(() => {
+          button.disabled = false;
+          button.style.opacity = "1";
+        }, 400);
+      }
+    });
+  }
+
+  function showToast(message) {
+    const existing = shadow.getElementById("intenta-toast");
+    if (existing) existing.remove();
+
+    const toast = document.createElement("div");
+    toast.id = "intenta-toast";
+    toast.textContent = message;
+
+    toast.style.cssText = `
+      position: fixed;
+      bottom: 150px;
+      right: 20px;
+      background: #111;
+      color: white;
+      padding: 10px 14px;
+      border-radius: 999px;
+      font-size: 13px;
+      font-weight: 600;
+      z-index: 2147483647;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+      animation: intentaToastIn 180ms ease-out;
+    `;
+
+    shadow.appendChild(toast);
+
+    setTimeout(() => {
+      toast.remove();
+    }, 1600);
   }
 
   function unlockAudio() {
@@ -67,10 +154,19 @@
       playCountdownTicks();
     }
 
+    if (message.type === "REALTIME_BLOCK") {
+      showBlockedOverlay();
+    }
+
+    if (message.type === "CLEAR_OVERLAYS") {
+      clearIntentaOverlays();
+    }
+
     if (message.type === "SESSION_COMPLETE") {
-      showCelebrationOverlay();
-      render();
-      stopUpdates();
+      clearIntentaOverlays();
+      showCelebrationOverlay(message.summary);
+      renderSessionState();
+      stopSessionStateUpdates();
       playSuccessSound();
     }
   });
@@ -92,6 +188,16 @@
   );
 
   function showBlockedOverlay() {
+    safeSendMessage({ type: "GET_SESSION_STATE" }, (state) => {
+      if (!state?.active || state.mode !== "FOCUS") return;
+      renderBlockedOverlay();
+    });
+  }
+
+  function renderBlockedOverlay() {
+    const existing = shadow.getElementById("intenta-block-overlay");
+    if (existing) return;
+
     const overlay = document.createElement("div");
     overlay.id = "intenta-block-overlay";
 
@@ -122,30 +228,38 @@
         gap: 12px;
       ">
         <p style="font-size:20px;font-weight:700;">This site is not part of your focus session.</p>
-        <button id="add">Add to session</button>
-        <button id="back">Go back</button>
+        <button id="add">Add to Focus</button>
+        <button id="back">Go Back</button>
       </div>
     `;
 
     shadow.appendChild(overlay);
     styleOverlayButtons(overlay);
 
-    shadow.getElementById("add").onclick = () => {
-      safeSendMessage(
-        {
+    withButtonFeedback(
+      shadow.getElementById("add"),
+      async () => {
+        await sendMessageWithFallback({
           type: "ADD_TO_ALLOWED_SITES",
           data: { domain: window.location.hostname }
-        },
-        () => {
-          overlay.remove();
+        });
+        overlay.remove();
+        setTimeout(() => {
           window.location.reload();
-        }
-      );
-    };
+        }, 500);
+      },
+      "Site added to focus"
+    );
 
-    shadow.getElementById("back").onclick = () => {
-      window.history.back();
-    };
+    withButtonFeedback(
+      shadow.getElementById("back"),
+      () => {
+        safeSendMessage({ type: "DISTRACTION_CLOSED" });
+        overlay.remove();
+        window.history.back();
+      },
+      ""
+    );
   }
 
   createWidget();
@@ -193,7 +307,7 @@
     shadow.appendChild(badge);
 
     widget.onclick = togglePanel;
-    startUpdates();
+    startSessionStateUpdates();
   }
 
   function togglePanel() {
@@ -239,17 +353,18 @@
       <div style="margin-top:10px; border-top:1px solid #333;"></div>
       <button id="stop">Stop</button>
       <button id="tabs">Use Tabs</button>
+      <button id="historyBtn">Session History</button>
     `;
 
     shadow.appendChild(panel);
     stylePanelControls(panel);
 
-    shadow.getElementById("start").onclick = () => {
+    withButtonFeedback(shadow.getElementById("start"), async () => {
       const cycles = Number(shadow.getElementById("cycles").value);
       const focus = Number(shadow.getElementById("focusTime").value);
       const breakTime = Number(shadow.getElementById("breakTime").value);
 
-      safeSendMessage({
+      await sendMessageWithFallback({
         type: "START_SESSION",
         data: {
           focus,
@@ -258,22 +373,33 @@
         }
       });
 
-      render();
-      startUpdates();
-    };
+      renderSessionState();
+      startSessionStateUpdates();
+    }, "Session started");
 
-    shadow.getElementById("stop").onclick = () => {
-      safeSendMessage({ type: "STOP_SESSION" });
-      stopUpdates();
-      render();
-    };
+    withButtonFeedback(shadow.getElementById("stop"), async () => {
+      await sendMessageWithFallback({ type: "STOP_SESSION" });
+      renderSessionState();
+      stopSessionStateUpdates();
+    }, "Session stopped");
 
-    shadow.getElementById("tabs").onclick = () => {
-      safeSendMessage({ type: "GET_TABS" });
-    };
+    withButtonFeedback(
+      shadow.getElementById("tabs"),
+      () => sendMessageWithFallback({ type: "GET_TABS" }),
+      "Open tabs added to focus"
+    );
 
-    render();
-    startUpdates();
+    withButtonFeedback(
+      shadow.getElementById("historyBtn"),
+      async () => {
+        const response = await sendMessageWithFallback({ type: "GET_SESSION_HISTORY" }, 1000);
+        showHistoryModal(response?.history || []);
+      },
+      ""
+    );
+
+    renderSessionState();
+    startSessionStateUpdates();
   }
 
   function stylePanelControls(panel) {
@@ -304,10 +430,12 @@
     const start = shadow.getElementById("start");
     const stop = shadow.getElementById("stop");
     const tabs = shadow.getElementById("tabs");
+    const history = shadow.getElementById("historyBtn");
 
     if (start) start.style.cssText = `${buttonBaseStyle} background: #22c55e; color: white;`;
     if (stop) stop.style.cssText = `${buttonBaseStyle} background: #ef4444; color: white;`;
     if (tabs) tabs.style.cssText = `${buttonBaseStyle} background: #222; color: white;`;
+    if (history) history.style.cssText = `${buttonBaseStyle} background: #222; color: white;`;
   }
 
   function styleOverlayButtons(container) {
@@ -324,26 +452,30 @@
     const add = container.querySelector("#add");
     const back = container.querySelector("#back");
     const closeCelebration = container.querySelector("#closeCelebration");
+    const closeHistory = container.querySelector("#closeHistory");
+    const clearHistory = container.querySelector("#clearHistoryBtn");
 
     if (add) add.style.cssText = `${buttonBaseStyle} background: #22c55e; color: white;`;
     if (back) back.style.cssText = `${buttonBaseStyle} background: #222; color: white;`;
     if (closeCelebration) closeCelebration.style.cssText = `${buttonBaseStyle} background: #22c55e; color: white;`;
+    if (closeHistory) closeHistory.style.cssText = `${buttonBaseStyle} background: #22c55e; color: white;`;
+    if (clearHistory) clearHistory.style.cssText = `${buttonBaseStyle} background: #ef4444; color: white;`;
   }
 
-  function startUpdates() {
+  function startSessionStateUpdates() {
     if (sessionStateInterval) return;
 
-    sessionStateInterval = setInterval(render, 1000);
+    sessionStateInterval = setInterval(renderSessionState, 1000);
   }
 
-  function stopUpdates() {
+  function stopSessionStateUpdates() {
     if (!sessionStateInterval) return;
 
     clearInterval(sessionStateInterval);
     sessionStateInterval = null;
   }
 
-  function render() {
+  function renderSessionState() {
     safeSendMessage({ type: "GET_SESSION_STATE" }, (state) => {
       if (!state) return;
 
@@ -355,13 +487,16 @@
       const start = shadow.getElementById("start");
       const stop = shadow.getElementById("stop");
       const tabs = shadow.getElementById("tabs");
+      const history = shadow.getElementById("historyBtn");
       const badge = shadow.getElementById("intenta-timer-badge");
-      const mode = state.active ? state.mode : "IDLE";
+      const isActive = Boolean(state && state.active);
+      const isFocus = isActive && state.mode === "FOCUS";
+      const mode = isActive ? state.mode : "IDLE";
       const remaining = format(state.remaining);
       const totalRemaining = formatLong(state.totalRemaining || 0);
 
       if (cycleText) {
-        cycleText.innerText = state.active
+        cycleText.innerText = isActive
           ? `Cycle: ${state.currentCycle} / ${state.totalCycles}`
           : "Cycle: -- / --";
       }
@@ -369,19 +504,52 @@
       if (timeText) timeText.innerText = "Remaining: " + remaining;
       if (totalText) totalText.innerText = "Total left: " + totalRemaining;
 
-      if (config) config.style.display = state.active ? "none" : "block";
-      if (start) start.style.display = state.active ? "none" : "";
-      if (stop) stop.style.display = state.active ? "" : "none";
-      if (tabs) tabs.style.display = state.active ? "" : "none";
+      if (!isActive || state.mode === "BREAK") removeBlockedOverlay();
+
+      if (config) config.style.display = isActive ? "none" : "flex";
+      if (start) start.style.display = isActive ? "none" : "block";
+      if (stop) stop.style.display = isActive ? "block" : "none";
+      if (tabs) tabs.style.display = isFocus ? "block" : "none";
+      if (history) history.style.display = isActive ? "none" : "block";
 
       if (badge) {
-        if (state.active) {
+        if (isActive) {
           badge.innerText = `${state.mode} ${remaining}`;
           badge.style.background = state.mode === "BREAK" ? "#2563eb" : "#16a34a";
           badge.style.display = "block";
         } else {
           badge.style.display = "none";
         }
+      }
+    });
+  }
+
+  function removeBlockedOverlay() {
+    const overlay = shadow.getElementById("intenta-block-overlay");
+    if (overlay) overlay.remove();
+  }
+
+  function clearIntentaOverlays() {
+    console.log("Clearing overlays");
+
+    const selectors = [
+      "#intenta-block-overlay",
+      "#intenta-celebration-overlay",
+      "#intenta-history-modal",
+      "#intenta-panel",
+      "#intenta-toast"
+    ];
+
+    selectors.forEach((selector) => {
+      const el =
+        shadow.querySelector(selector) ||
+        document.querySelector(selector);
+
+      console.log("Removing:", selector, el);
+
+      if (el) {
+        console.log("Removing", selector);
+        el.remove();
       }
     });
   }
@@ -402,7 +570,97 @@
     return `${hours}:${minutes}:${seconds}`;
   }
 
-  function showCelebrationOverlay() {
+  function showHistoryModal(history) {
+    const existing = shadow.getElementById("intenta-history-modal");
+    if (existing) existing.remove();
+
+    const overlay = document.createElement("div");
+    overlay.id = "intenta-history-modal";
+
+    overlay.style = `
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.75);
+      z-index: 2147483647;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+    `;
+
+    const listHtml = history.length
+      ? history.map((item) => `
+          <div style="
+            background: #181818;
+            border: 1px solid #333;
+            border-radius: 10px;
+            padding: 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+          ">
+            <div style="font-weight:700;">${item.cyclesCompleted || 0}/${item.totalCycles || 0} cycles • ${item.focusTimeFormatted || `${item.focusMinutes || 0} min`} focus</div>
+            <div style="font-size:12px;opacity:0.75;">Closed: ${item.distractionsClosed || 0} • Added: ${item.sitesAdded || 0}</div>
+            <div style="font-size:12px;opacity:0.6;">${formatHistoryDate(item.completedAt)}</div>
+          </div>
+        `).join("")
+      : `<div style="font-size:13px;opacity:0.75;text-align:center;">No sessions yet</div>`;
+
+    overlay.innerHTML = `
+      <div style="
+        width: calc(100% - 32px);
+        max-width: 420px;
+        max-height: 80vh;
+        overflow: auto;
+        background: #111;
+        color: white;
+        padding: 20px;
+        border-radius: 16px;
+        line-height: 1.4;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        box-shadow: 0 20px 50px rgba(0,0,0,0.4);
+      ">
+        <h2 style="font-size:18px;">Session History</h2>
+        <div style="display:flex;flex-direction:column;gap:10px;">${listHtml}</div>
+        ${history.length ? `<button id="clearHistoryBtn">Clear History</button>` : ""}
+        <button id="closeHistory">Close</button>
+      </div>
+    `;
+
+    shadow.appendChild(overlay);
+    styleOverlayButtons(overlay);
+
+    shadow.getElementById("closeHistory").addEventListener("click", () => {
+      overlay.remove();
+    });
+
+    const clearHistoryBtn = shadow.getElementById("clearHistoryBtn");
+
+    if (clearHistoryBtn) {
+      clearHistoryBtn.addEventListener("click", () => {
+        if (!confirm("Clear all session history?")) return;
+
+        safeSendMessage({ type: "CLEAR_SESSION_HISTORY" }, () => {
+          showHistoryModal([]);
+        });
+      });
+    }
+  }
+
+  function formatHistoryDate(value) {
+    if (!value) return "Unknown time";
+
+    return new Date(value).toLocaleString([], {
+      month: "short",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit"
+    });
+  }
+
+  function showCelebrationOverlay(summary = {}) {
     const existing = shadow.getElementById("intenta-celebration-overlay");
     if (existing) existing.remove();
 
@@ -439,6 +697,24 @@
         <div style="font-size: 42px;">🎉</div>
         <h2>Session Complete</h2>
         <p>You showed up. You stayed intentional.</p>
+        <div style="
+          width: 100%;
+          background: #181818;
+          border: 1px solid #333;
+          border-radius: 12px;
+          padding: 14px;
+          display: flex;
+          flex-direction: column;
+          gap: 8px;
+          text-align: left;
+          font-size: 14px;
+        ">
+          <div><strong>Cycles:</strong> ${summary.cyclesCompleted || 0}/${summary.totalCycles || 0}</div>
+          <div><strong>Focus time:</strong> ${summary.focusTimeFormatted || `${summary.focusMinutes || 0} min`}</div>
+          <div><strong>Break time:</strong> ${summary.breakTimeFormatted || `${summary.breakMinutes || 0} min`}</div>
+          <div><strong>Distractions closed:</strong> ${summary.distractionsClosed || 0}</div>
+          <div><strong>Sites added to focus:</strong> ${summary.sitesAdded || 0}</div>
+        </div>
         <button id="closeCelebration">Done</button>
       </div>
     `;
@@ -446,9 +722,10 @@
     shadow.appendChild(overlay);
     styleOverlayButtons(overlay);
 
-    shadow.getElementById("closeCelebration").onclick = () => {
-      overlay.remove();
-    };
+    const doneBtn = shadow.getElementById("closeCelebration");
+    doneBtn.addEventListener("click", () => {
+      safeSendMessage({ type: "CLEAR_ALL_OVERLAYS" });
+    });
   }
 
   function playSuccessSound() {
