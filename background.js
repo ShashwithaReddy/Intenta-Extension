@@ -77,7 +77,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // 🔹 PAGE DATA (CORE LOGIC)
   else if (message.type === "PAGE_DATA") {
     const { url } = message.data;
-    const domain = normalizeDomain(new URL(url).hostname);
     syncSessionState();
 
     if (!session.active) {
@@ -90,11 +89,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    // Allow Google search results
-    if (url.includes("google.com/search")) {
+    if (isAllowedGoogleRedirect(url)) {
       sendResponse({ action: "ALLOW" });
       return;
     }
+
+    const domain = normalizeDomain(new URL(url).hostname);
 
     chrome.storage.local.get(["allowedSites"], (result) => {
       const allowedSites = result.allowedSites || [];
@@ -162,7 +162,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     chrome.tabs.query({}, (tabs) => {
       const domains = tabs.map(tab => {
         try {
-          if (!tab.url || isUnsupportedUrl(tab.url) || tab.url.includes("google.com/search")) {
+          if (!tab.url || isUnsupportedUrl(tab.url) || isAllowedGoogleRedirect(tab.url)) {
             return null;
           }
 
@@ -254,7 +254,7 @@ function evaluateTab(tabId, url, shouldSync = true) {
     return;
   }
 
-  if (url.includes("google.com/search")) {
+  if (isAllowedGoogleRedirect(url)) {
     return;
   }
 
@@ -291,6 +291,23 @@ function isUnsupportedUrl(url) {
     url.startsWith("edge://") ||
     url.startsWith("about:")
   );
+}
+
+function isAllowedGoogleRedirect(url) {
+  try {
+    const parsed = new URL(url);
+
+    return (
+      parsed.origin === "https://www.google.com" &&
+      (
+        parsed.pathname === "/" ||
+        parsed.pathname === "/webhp" ||
+        parsed.pathname === "/search"
+      )
+    );
+  } catch {
+    return false;
+  }
 }
 
 function syncSessionState() {

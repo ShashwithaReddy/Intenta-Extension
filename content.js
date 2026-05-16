@@ -302,7 +302,11 @@
     leaveButton.addEventListener("click", () => {
       youtubeInterventionState[type].suppressedUntil = 0;
       overlay.remove();
-      window.history.back();
+      if (type === "HOME_FEED") {
+        window.location.href = "https://www.google.com/search?q=";
+      } else {
+        window.history.back();
+      }
     });
   }
 
