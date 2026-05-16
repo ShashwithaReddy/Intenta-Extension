@@ -44,12 +44,76 @@
         transform: translateY(0) scale(1);
       }
     }
+
+    @keyframes intentaOverlayFadeIn {
+      from {
+        opacity: 0;
+      }
+      to {
+        opacity: 1;
+      }
+    }
   `;
   shadow.appendChild(style);
 
   let sessionStateInterval = null;
   let audioCtx = null;
   let audioUnlocked = false;
+  let lastUrl = location.href;
+  let lastYouTubeIntervention = 0;
+
+  function detectYouTubePageType() {
+    if (!location.hostname.includes("youtube.com")) {
+      return null;
+    }
+
+    const url = location.href;
+
+    if (url.includes("/shorts/")) {
+      return "SHORTS";
+    }
+
+    if (url.includes("/results?search_query=")) {
+      return "SEARCH_RESULTS";
+    }
+
+    if (url.includes("/watch?v=")) {
+      return "WATCH_PAGE";
+    }
+
+    if (url.includes("/feed/subscriptions")) {
+      return "SUBSCRIPTIONS";
+    }
+
+    if (
+      location.pathname === "/" ||
+      location.pathname === ""
+    ) {
+      return "HOME_FEED";
+    }
+
+    return "OTHER";
+  }
+
+  const ytType = detectYouTubePageType();
+
+  if (ytType) {
+    console.log("Intenta YouTube Type:", ytType);
+  }
+
+  maybeShowYouTubeIntervention();
+
+  setInterval(() => {
+    if (location.href !== lastUrl) {
+      lastUrl = location.href;
+      removeYouTubeInterventionOverlay();
+
+      const ytType = detectYouTubePageType();
+
+      console.log("YouTube changed:", ytType);
+      maybeShowYouTubeIntervention();
+    }
+  }, 1000);
 
   function safeSendMessage(message, callback) {
     try {
@@ -131,6 +195,123 @@
     }, 1600);
   }
 
+  function maybeShowYouTubeIntervention() {
+    const ytType = detectYouTubePageType();
+
+    if (ytType !== "HOME_FEED" && ytType !== "SHORTS") {
+      return;
+    }
+
+    if (Date.now() - lastYouTubeIntervention <= 30000) {
+      return;
+    }
+
+    safeSendMessage({ type: "GET_SESSION_STATE" }, (state) => {
+      if (!state?.active || state.mode !== "FOCUS") return;
+      if (Date.now() - lastYouTubeIntervention <= 30000) return;
+      if (shadow.getElementById("intenta-block-overlay")) return;
+
+      showYouTubeInterventionOverlay(ytType);
+    });
+  }
+
+  function showYouTubeInterventionOverlay(type) {
+    if (
+      shadow.getElementById("intenta-youtube-overlay") ||
+      document.getElementById("intenta-youtube-overlay")
+    ) {
+      return;
+    }
+
+    lastYouTubeIntervention = Date.now();
+
+    const overlay = document.createElement("div");
+    overlay.id = "intenta-youtube-overlay";
+
+    overlay.style = `
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.72);
+      z-index: 2147483647;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      animation: intentaOverlayFadeIn 180ms ease-out;
+    `;
+
+    const isShorts = type === "SHORTS";
+
+    overlay.innerHTML = `
+      <div style="
+        width: calc(100% - 32px);
+        max-width: 380px;
+        background: #111;
+        color: white;
+        padding: 24px;
+        border-radius: 14px;
+        text-align: center;
+        line-height: 1.4;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 12px;
+        box-shadow: 0 20px 50px rgba(0,0,0,0.4);
+      ">
+        <p style="font-size:20px;font-weight:700;">
+          ${isShorts ? "Shorts can easily become unconscious scrolling." : "What are you here for?"}
+        </p>
+        ${isShorts ? `
+          <button id="ytContinue">Continue Anyway</button>
+          <button id="ytLeave">Leave</button>
+        ` : `
+          <button id="ytSearch">Search Something</button>
+          <button id="ytContinue">Continue Intentionally</button>
+          <button id="ytLeave">Leave</button>
+        `}
+      </div>
+    `;
+
+    shadow.appendChild(overlay);
+    styleOverlayButtons(overlay);
+
+    const searchButton = shadow.getElementById("ytSearch");
+    const continueButton = shadow.getElementById("ytContinue");
+    const leaveButton = shadow.getElementById("ytLeave");
+
+    if (searchButton) {
+      searchButton.addEventListener("click", () => {
+        focusYouTubeSearchInput();
+        overlay.remove();
+      });
+    }
+
+    continueButton.addEventListener("click", () => {
+      overlay.remove();
+    });
+
+    leaveButton.addEventListener("click", () => {
+      overlay.remove();
+      window.history.back();
+    });
+  }
+
+  function focusYouTubeSearchInput() {
+    const searchInput = document.querySelector(
+      "input#search, input[name='search_query'], ytd-searchbox input"
+    );
+
+    if (!searchInput) return;
+
+    searchInput.focus();
+    if (searchInput.select) searchInput.select();
+  }
+
+  function removeYouTubeInterventionOverlay() {
+    const overlay = shadow.getElementById("intenta-youtube-overlay");
+    if (overlay) overlay.remove();
+  }
+
   function unlockAudio() {
     if (audioUnlocked) return;
 
@@ -197,6 +378,8 @@
   function renderBlockedOverlay() {
     const existing = shadow.getElementById("intenta-block-overlay");
     if (existing) return;
+
+    removeYouTubeInterventionOverlay();
 
     const overlay = document.createElement("div");
     overlay.id = "intenta-block-overlay";
@@ -454,12 +637,18 @@
     const closeCelebration = container.querySelector("#closeCelebration");
     const closeHistory = container.querySelector("#closeHistory");
     const clearHistory = container.querySelector("#clearHistoryBtn");
+    const ytSearch = container.querySelector("#ytSearch");
+    const ytContinue = container.querySelector("#ytContinue");
+    const ytLeave = container.querySelector("#ytLeave");
 
     if (add) add.style.cssText = `${buttonBaseStyle} background: #22c55e; color: white;`;
     if (back) back.style.cssText = `${buttonBaseStyle} background: #222; color: white;`;
     if (closeCelebration) closeCelebration.style.cssText = `${buttonBaseStyle} background: #22c55e; color: white;`;
     if (closeHistory) closeHistory.style.cssText = `${buttonBaseStyle} background: #22c55e; color: white;`;
     if (clearHistory) clearHistory.style.cssText = `${buttonBaseStyle} background: #ef4444; color: white;`;
+    if (ytSearch) ytSearch.style.cssText = `${buttonBaseStyle} background: #22c55e; color: white;`;
+    if (ytContinue) ytContinue.style.cssText = `${buttonBaseStyle} background: #222; color: white;`;
+    if (ytLeave) ytLeave.style.cssText = `${buttonBaseStyle} background: #ef4444; color: white;`;
   }
 
   function startSessionStateUpdates() {
@@ -505,6 +694,11 @@
       if (totalText) totalText.innerText = "Total left: " + totalRemaining;
 
       if (!isActive || state.mode === "BREAK") removeBlockedOverlay();
+      if (isFocus) {
+        maybeShowYouTubeIntervention();
+      } else {
+        removeYouTubeInterventionOverlay();
+      }
 
       if (config) config.style.display = isActive ? "none" : "flex";
       if (start) start.style.display = isActive ? "none" : "block";
@@ -534,6 +728,7 @@
 
     const selectors = [
       "#intenta-block-overlay",
+      "#intenta-youtube-overlay",
       "#intenta-celebration-overlay",
       "#intenta-history-modal",
       "#intenta-panel",
