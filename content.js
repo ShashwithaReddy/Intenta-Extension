@@ -60,6 +60,8 @@
   let audioCtx = null;
   let audioUnlocked = false;
   let lastUrl = location.href;
+  let currentYouTubeContext = null;
+  let lastLoggedYouTubeContextKey = null;
   let youtubeInterventionState = {
     HOME_FEED: {
       suppressedUntil: 0
@@ -102,12 +104,94 @@
     return "OTHER";
   }
 
+  function getYouTubeVideoTitle() {
+    const selectors = [
+      "h1.ytd-watch-metadata yt-formatted-string",
+      "ytd-watch-metadata h1 yt-formatted-string",
+      "h1.title yt-formatted-string",
+      "h1"
+    ];
+
+    for (const selector of selectors) {
+      const el = document.querySelector(selector);
+      const text = el?.textContent?.trim();
+
+      if (text) return text;
+    }
+
+    return null;
+  }
+
+  function updateYouTubeContext(ytType) {
+    if (!ytType) {
+      currentYouTubeContext = null;
+      return;
+    }
+
+    currentYouTubeContext = {
+      type: ytType,
+      url: location.href,
+      title: null,
+      updatedAt: Date.now()
+    };
+
+    if (ytType === "WATCH_PAGE") {
+      logYouTubeVideoTitleWithRetry();
+      return;
+    }
+
+    logYouTubeContext();
+  }
+
+  function logYouTubeVideoTitleWithRetry(retries = 10) {
+    if (detectYouTubePageType() !== "WATCH_PAGE") {
+      return;
+    }
+
+    const title = getYouTubeVideoTitle();
+
+    if (title) {
+      console.log("Intenta YouTube Video:", title);
+      currentYouTubeContext = {
+        type: "WATCH_PAGE",
+        url: location.href,
+        title,
+        updatedAt: Date.now()
+      };
+      logYouTubeContext();
+      return;
+    }
+
+    if (retries <= 0) {
+      console.log("Intenta YouTube Video: title not found");
+      return;
+    }
+
+    setTimeout(() => {
+      logYouTubeVideoTitleWithRetry(retries - 1);
+    }, 500);
+  }
+
+  function logYouTubeContext() {
+    if (!currentYouTubeContext) return;
+
+    const key = `${currentYouTubeContext.url}|${currentYouTubeContext.title || ""}`;
+
+    if (key === lastLoggedYouTubeContextKey) {
+      return;
+    }
+
+    lastLoggedYouTubeContextKey = key;
+    console.log("Intenta YouTube Context:", currentYouTubeContext);
+  }
+
   const ytType = detectYouTubePageType();
 
   if (ytType) {
     console.log("Intenta YouTube Type:", ytType);
   }
 
+  updateYouTubeContext(ytType);
   maybeShowYouTubeIntervention();
 
   setInterval(() => {
@@ -118,6 +202,7 @@
       const ytType = detectYouTubePageType();
 
       console.log("YouTube changed:", ytType);
+      updateYouTubeContext(ytType);
       maybeShowYouTubeIntervention();
     }
   }, 1000);
