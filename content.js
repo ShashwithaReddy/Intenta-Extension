@@ -569,10 +569,10 @@
         gap: 12px;
         box-shadow: 0 20px 50px rgba(0,0,0,0.4);
       ">
-        <p style="font-size:20px;font-weight:700;">Pause for a second</p>
-        <p style="font-size:14px;opacity:0.82;">This video may pull you away from your focus session.</p>
-        <p style="font-size:12px;opacity:0.6;">Current focus session is active.</p>
-        <button id="ytDistractionContinue">Continue Intentionally</button>
+        <p style="font-size:20px;font-weight:700;">Stay intentional</p>
+        <p style="font-size:14px;opacity:0.82;">This video may not support your current focus.</p>
+        <p style="font-size:12px;opacity:0.6;">If you continue, Intenta will check in again in 3 minutes.</p>
+        <button id="ytDistractionContinue">Continue for 3 min</button>
         <button id="ytDistractionLeave">Leave Video</button>
       </div>
     `;
@@ -581,6 +581,7 @@
     styleOverlayButtons(overlay);
 
     shadow.getElementById("ytDistractionContinue").addEventListener("click", () => {
+      // TODO: Hard Mode after AI relevance scoring is stable.
       suppressVideoIntervention(url, 3);
       overlay.remove();
       scheduleVideoInterventionRecheck(url, 3);
@@ -938,6 +939,7 @@
         <div id="goalText" style="font-weight: 600;">Goal: --</div>
         <div id="cycleText" style="font-weight: 600;">Cycle: -- / --</div>
         <div id="modeText" style="font-weight: 600;">Mode: IDLE</div>
+        <div id="pausedFromText" style="font-size: 12px; opacity: 0.75; display:none;">Paused from: --</div>
         <div id="timeText" style="font-weight: 600;">Remaining: --:--</div>
         <div id="totalText" style="font-size: 12px; opacity: 0.7;">Total left: --:--:--</div>
       </div>
@@ -950,6 +952,8 @@
         <button id="start">Start Session</button>
       </div>
       <div style="margin-top:10px; border-top:1px solid #333;"></div>
+      <button id="pause">Pause</button>
+      <button id="resume">Resume</button>
       <button id="stop">Stop</button>
       <button id="tabs">Use Tabs</button>
       <button id="historyBtn">Session History</button>
@@ -992,6 +996,18 @@
       renderSessionState();
       stopSessionStateUpdates();
     }, "Session stopped");
+
+    withButtonFeedback(shadow.getElementById("pause"), async () => {
+      await sendMessageWithFallback({ type: "PAUSE_SESSION" });
+      clearPauseOverlays();
+      renderSessionState();
+    }, "Session paused");
+
+    withButtonFeedback(shadow.getElementById("resume"), async () => {
+      await sendMessageWithFallback({ type: "RESUME_SESSION" });
+      renderSessionState();
+      startSessionStateUpdates();
+    }, "Session resumed");
 
     withButtonFeedback(
       shadow.getElementById("tabs"),
@@ -1038,11 +1054,15 @@
     });
 
     const start = shadow.getElementById("start");
+    const pause = shadow.getElementById("pause");
+    const resume = shadow.getElementById("resume");
     const stop = shadow.getElementById("stop");
     const tabs = shadow.getElementById("tabs");
     const history = shadow.getElementById("historyBtn");
 
     if (start) start.style.cssText = `${buttonBaseStyle} background: #22c55e; color: white;`;
+    if (pause) pause.style.cssText = `${buttonBaseStyle} background: #f59e0b; color: white;`;
+    if (resume) resume.style.cssText = `${buttonBaseStyle} background: #22c55e; color: white;`;
     if (stop) stop.style.cssText = `${buttonBaseStyle} background: #ef4444; color: white;`;
     if (tabs) tabs.style.cssText = `${buttonBaseStyle} background: #222; color: white;`;
     if (history) history.style.cssText = `${buttonBaseStyle} background: #222; color: white;`;
@@ -1104,16 +1124,20 @@
       const cycleText = shadow.getElementById("cycleText");
       const goalText = shadow.getElementById("goalText");
       const modeText = shadow.getElementById("modeText");
+      const pausedFromText = shadow.getElementById("pausedFromText");
       const timeText = shadow.getElementById("timeText");
       const totalText = shadow.getElementById("totalText");
       const config = shadow.getElementById("session-config");
       const start = shadow.getElementById("start");
+      const pause = shadow.getElementById("pause");
+      const resume = shadow.getElementById("resume");
       const stop = shadow.getElementById("stop");
       const tabs = shadow.getElementById("tabs");
       const history = shadow.getElementById("historyBtn");
       const badge = shadow.getElementById("intenta-timer-badge");
       const isActive = Boolean(state && state.active);
       const isFocus = isActive && state.mode === "FOCUS";
+      const isPaused = isActive && state.paused;
       const mode = isActive ? state.mode : "IDLE";
       const remaining = format(state.remaining);
       const totalRemaining = formatLong(state.totalRemaining || 0);
@@ -1133,10 +1157,14 @@
           : "Cycle: -- / --";
       }
       if (modeText) modeText.innerText = "Mode: " + mode;
+      if (pausedFromText) {
+        pausedFromText.innerText = `Paused from: ${state.previousModeBeforePause || "FOCUS"}`;
+        pausedFromText.style.display = isPaused ? "block" : "none";
+      }
       if (timeText) timeText.innerText = "Remaining: " + remaining;
       if (totalText) totalText.innerText = "Total left: " + totalRemaining;
 
-      if (!isActive || state.mode === "BREAK") removeBlockedOverlay();
+      if (!isActive || state.mode === "BREAK" || isPaused) removeBlockedOverlay();
       if (isFocus) {
         runYouTubeAwarenessIfFocus();
       } else {
@@ -1146,6 +1174,8 @@
 
       if (config) config.style.display = isActive ? "none" : "flex";
       if (start) start.style.display = isActive ? "none" : "block";
+      if (pause) pause.style.display = isActive && !isPaused ? "block" : "none";
+      if (resume) resume.style.display = isPaused ? "block" : "none";
       if (stop) stop.style.display = isActive ? "block" : "none";
       if (tabs) tabs.style.display = isFocus ? "block" : "none";
       if (history) history.style.display = isActive ? "none" : "block";
@@ -1153,7 +1183,11 @@
       if (badge) {
         if (isActive) {
           badge.innerText = `${state.mode} ${remaining}`;
-          badge.style.background = state.mode === "BREAK" ? "#2563eb" : "#16a34a";
+          badge.style.background = isPaused
+            ? "#6b7280"
+            : state.mode === "BREAK"
+              ? "#2563eb"
+              : "#16a34a";
           badge.style.display = "block";
         } else {
           badge.style.display = "none";
@@ -1199,6 +1233,20 @@
 
     document.querySelectorAll(".intenta-overlay").forEach((el) => {
       el.remove();
+    });
+  }
+
+  function clearPauseOverlays() {
+    [
+      "#intenta-block-overlay",
+      "#intenta-youtube-overlay",
+      "#intenta-distraction-overlay",
+      "#intenta-celebration-overlay",
+      "#intenta-history-modal",
+      "#intenta-toast"
+    ].forEach((selector) => {
+      const el = shadow.querySelector(selector) || document.querySelector(selector);
+      if (el) el.remove();
     });
   }
 
