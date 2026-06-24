@@ -3,12 +3,18 @@ console.log("Intenta background running");
 let session = {
   active: false,
   mode: "IDLE",
+  paused: false,
+  pausedAt: null,
+  remainingAtPause: 0,
+  previousModeBeforePause: null,
   startTime: null,
+  sessionStartTime: null,
   duration: 0,
   focusDuration: 0,
   breakDuration: 0,
   currentCycle: 0,
   totalCycles: 0,
+  focusGoal: "",
   warned5: false,
   distractionsClosed: 0,
   sitesAdded: 0,
@@ -18,6 +24,13 @@ let session = {
 const DEFAULT_FOCUS_MINUTES = 50;
 const DEFAULT_BREAK_MINUTES = 10;
 const DEFAULT_CYCLES = 3;
+const SESSION_STATE_KEY = "sessionState";
+
+chrome.storage.local.get([SESSION_STATE_KEY], (result) => {
+  if (result.sessionState) {
+    restoreSessionState(result.sessionState);
+  }
+});
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
@@ -35,37 +48,35 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       Number.isFinite(message.data?.cycles) && message.data.cycles > 0
         ? message.data.cycles
         : DEFAULT_CYCLES;
+    const focusGoal = message.data?.focusGoal?.trim() || "Focus Session";
 
     session.active = true;
     session.mode = "FOCUS";
+    session.paused = false;
+    session.pausedAt = null;
+    session.remainingAtPause = 0;
+    session.previousModeBeforePause = null;
     session.startTime = Date.now();
+    session.sessionStartTime = Date.now();
     session.focusDuration = focusMinutes * 60 * 1000;
     session.breakDuration = breakMinutes * 60 * 1000;
     session.totalCycles = Math.floor(cycles);
     session.currentCycle = 1;
+    session.focusGoal = focusGoal;
     session.duration = session.focusDuration;
     session.warned5 = false;
     session.distractionsClosed = 0;
     session.sitesAdded = 0;
     session.addedDomains = new Set();
+    persistSessionState();
 
     console.log("Focus session started");
   }
 
   // 🔹 STOP SESSION
   else if (message.type === "STOP_SESSION") {
-    session.active = false;
-    session.mode = "IDLE";
-    session.startTime = null;
-    session.duration = 0;
-    session.focusDuration = 0;
-    session.breakDuration = 0;
-    session.currentCycle = 0;
-    session.totalCycles = 0;
-    session.warned5 = false;
-    session.distractionsClosed = 0;
-    session.sitesAdded = 0;
-    session.addedDomains = new Set();
+    saveStoppedSession();
+    stopSessionState();
 
     chrome.storage.local.remove(["allowedSites"], () => {
       console.log("Session cleared");
@@ -74,10 +85,42 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     console.log("Session stopped");
   }
 
+  // 🔹 PAUSE SESSION
+  else if (message.type === "PAUSE_SESSION") {
+    if (session.active && !session.paused) {
+      const remainingAtPause = getRemainingTime();
+
+      session.paused = true;
+      session.pausedAt = Date.now();
+      session.remainingAtPause = remainingAtPause;
+      session.previousModeBeforePause = session.mode;
+      session.mode = "PAUSED";
+      persistSessionState();
+    }
+  }
+
+  // 🔹 RESUME SESSION
+  else if (message.type === "RESUME_SESSION") {
+    if (session.active && session.paused) {
+      session.paused = false;
+      session.mode = session.previousModeBeforePause || "FOCUS";
+      session.startTime = Date.now();
+      session.duration = session.remainingAtPause;
+      session.pausedAt = null;
+      session.remainingAtPause = 0;
+      session.previousModeBeforePause = null;
+      session.warned5 = false;
+      persistSessionState();
+
+      if (session.mode === "FOCUS") {
+        evaluateAllTabs();
+      }
+    }
+  }
+
   // 🔹 PAGE DATA (CORE LOGIC)
   else if (message.type === "PAGE_DATA") {
     const { url } = message.data;
-    const domain = normalizeDomain(new URL(url).hostname);
     syncSessionState();
 
     if (!session.active) {
@@ -85,16 +128,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return;
     }
 
-    if (session.mode === "BREAK") {
+    if (session.paused || session.mode !== "FOCUS") {
       sendResponse({ action: "ALLOW" });
       return;
     }
 
-    // Allow Google search results
-    if (url.includes("google.com/search")) {
+    if (isAllowedGoogleRedirect(url)) {
       sendResponse({ action: "ALLOW" });
       return;
     }
+
+    const domain = normalizeDomain(new URL(url).hostname);
 
     chrome.storage.local.get(["allowedSites"], (result) => {
       const allowedSites = result.allowedSites || [];
@@ -120,10 +164,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     sendResponse({
       active: session.active,
       mode: session.mode,
+      paused: session.paused,
+      previousModeBeforePause: session.previousModeBeforePause,
       remaining,
       totalRemaining,
       currentCycle: session.currentCycle,
       totalCycles: session.totalCycles,
+      focusGoal: session.focusGoal || "",
       focusMinutes: session.focusDuration / 60 / 1000,
       breakMinutes: session.breakDuration / 60 / 1000
     });
@@ -150,6 +197,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         if (!isAlreadyAllowed) {
           trackAddedDomain(domain);
         }
+        persistSessionState();
         sendResponse({ success: true });
       });
     });
@@ -162,7 +210,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     chrome.tabs.query({}, (tabs) => {
       const domains = tabs.map(tab => {
         try {
-          if (!tab.url || isUnsupportedUrl(tab.url) || tab.url.includes("google.com/search")) {
+          if (!tab.url || isUnsupportedUrl(tab.url) || isAllowedGoogleRedirect(tab.url)) {
             return null;
           }
 
@@ -183,6 +231,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
         chrome.storage.local.set({ allowedSites: updated }, () => {
           newlyAddedDomains.forEach(trackAddedDomain);
+          persistSessionState();
         });
       });
     });
@@ -213,6 +262,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // 🔹 USER CLOSED A DISTRACTION
   else if (message.type === "DISTRACTION_CLOSED") {
     session.distractionsClosed = (session.distractionsClosed || 0) + 1;
+    persistSessionState();
   }
 
   // 🔹 CLEAR OVERLAYS IN ALL TABS
@@ -254,7 +304,7 @@ function evaluateTab(tabId, url, shouldSync = true) {
     return;
   }
 
-  if (url.includes("google.com/search")) {
+  if (isAllowedGoogleRedirect(url)) {
     return;
   }
 
@@ -293,7 +343,28 @@ function isUnsupportedUrl(url) {
   );
 }
 
+function isAllowedGoogleRedirect(url) {
+  try {
+    const parsed = new URL(url);
+
+    return (
+      parsed.origin === "https://www.google.com" &&
+      (
+        parsed.pathname === "/" ||
+        parsed.pathname === "/webhp" ||
+        parsed.pathname === "/search"
+      )
+    );
+  } catch {
+    return false;
+  }
+}
+
 function syncSessionState() {
+  if (session.paused || session.mode === "PAUSED") {
+    return;
+  }
+
   if (!session.active || !session.startTime || !session.duration) {
     return;
   }
@@ -302,6 +373,7 @@ function syncSessionState() {
 
   if (remaining <= 5000 && !session.warned5) {
     session.warned5 = true;
+    persistSessionState();
     broadcast({
       type: "COUNTDOWN_START",
       mode: session.mode
@@ -318,6 +390,7 @@ function syncSessionState() {
   if (session.mode === "FOCUS") {
     session.mode = "BREAK";
     session.duration = session.breakDuration;
+    persistSessionState();
   } else if (session.mode === "BREAK") {
     if (session.currentCycle >= session.totalCycles) {
       const summary = buildSessionSummary();
@@ -334,6 +407,7 @@ function syncSessionState() {
     session.currentCycle++;
     session.mode = "FOCUS";
     session.duration = session.focusDuration;
+    persistSessionState();
     evaluateAllTabs();
   }
 }
@@ -341,16 +415,23 @@ function syncSessionState() {
 function stopSessionState() {
   session.active = false;
   session.mode = "IDLE";
+  session.paused = false;
+  session.pausedAt = null;
+  session.remainingAtPause = 0;
+  session.previousModeBeforePause = null;
   session.startTime = null;
+  session.sessionStartTime = null;
   session.duration = 0;
   session.focusDuration = 0;
   session.breakDuration = 0;
   session.currentCycle = 0;
   session.totalCycles = 0;
+  session.focusGoal = "";
   session.warned5 = false;
   session.distractionsClosed = 0;
   session.sitesAdded = 0;
   session.addedDomains = new Set();
+  persistSessionState();
 }
 
 function trackAddedDomain(domain) {
@@ -392,7 +473,10 @@ function buildSessionSummary() {
       Math.max((session.totalCycles || 0) - 1, 0)) / 60000;
 
   return {
+    id: Date.now(),
+    status: "COMPLETED",
     completedAt: Date.now(),
+    focusGoal: session.focusGoal || "",
     cyclesCompleted: session.totalCycles || session.currentCycle || 0,
     totalCycles: session.totalCycles || 0,
     focusMinutes,
@@ -405,13 +489,66 @@ function buildSessionSummary() {
 }
 
 function saveSessionHistory(summary) {
+  addToSessionHistory(summary);
+}
+
+function addToSessionHistory(historyItem) {
   chrome.storage.local.get(["sessionHistory"], (result) => {
     const existing = result.sessionHistory || [];
-    const updated = [summary, ...existing].slice(0, 20);
+    const updated = [historyItem, ...existing].slice(0, 20);
 
     chrome.storage.local.set({
       sessionHistory: updated
     });
+  });
+}
+
+function saveStoppedSession() {
+  if (!session.active || !session.sessionStartTime) {
+    return;
+  }
+
+  const elapsedMinutes =
+    (Date.now() - session.sessionStartTime) / (1000 * 60);
+
+  if (elapsedMinutes < 5) {
+    return;
+  }
+
+  const historyItem = {
+    id: Date.now(),
+    status: "STOPPED_EARLY",
+    completedAt: new Date().toISOString(),
+    focusGoal: session.focusGoal,
+    completedCycles: Math.max((session.currentCycle || 0) - 1, 0),
+    totalCycles: session.totalCycles,
+    focusMinutesSpent: Math.round(elapsedMinutes),
+    sitesAdded: session.sitesAdded || 0,
+    distractionsClosed: session.distractionsClosed || 0
+  };
+
+  addToSessionHistory(historyItem);
+}
+
+function serializeSessionState() {
+  return {
+    ...session,
+    addedDomains: [...session.addedDomains]
+  };
+}
+
+function restoreSessionState(savedSession) {
+  session = {
+    ...session,
+    ...savedSession,
+    focusGoal: savedSession.focusGoal || "",
+    addedDomains: new Set(savedSession.addedDomains || [])
+  };
+}
+
+function persistSessionState() {
+  chrome.storage.local.set({
+    [SESSION_STATE_KEY]: serializeSessionState()
   });
 }
 
@@ -434,6 +571,10 @@ function safeSendToTab(tabId, message) {
 }
 
 function getRemainingTime() {
+  if (session.paused || session.mode === "PAUSED") {
+    return session.remainingAtPause || 0;
+  }
+
   if (!session.active || !session.startTime) {
     return 0;
   }
@@ -449,7 +590,11 @@ function getTotalRemainingTime(currentRemaining) {
   const focusBreakDuration = session.focusDuration + session.breakDuration;
   const remainingFullCycles = Math.max(session.totalCycles - session.currentCycle, 0);
 
-  if (session.mode === "FOCUS") {
+  const effectiveMode = session.mode === "PAUSED"
+    ? session.previousModeBeforePause
+    : session.mode;
+
+  if (effectiveMode === "FOCUS") {
     return currentRemaining + session.breakDuration + (remainingFullCycles * focusBreakDuration);
   }
 
