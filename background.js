@@ -265,6 +265,30 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     persistSessionState();
   }
 
+  // 🔹 AI INTENT ALIGNMENT (proxy through local backend)
+  else if (message.type === "AI_CLASSIFY_INTENT") {
+    if (!shouldRunIntelligence()) {
+      sendResponse({
+        alignment: "UNCLEAR",
+        confidence: 0,
+        reason: "Intelligence is disabled outside active focus sessions."
+      });
+      return true;
+    }
+
+    classifyIntentWithBackend(message.data)
+      .then(sendResponse)
+      .catch((error) => {
+        sendResponse({
+          alignment: "UNCLEAR",
+          confidence: 0,
+          reason: error?.message || "AI backend unavailable"
+        });
+      });
+
+    return true;
+  }
+
   // 🔹 CLEAR OVERLAYS IN ALL TABS
   else if (message.type === "CLEAR_ALL_OVERLAYS") {
     chrome.tabs.query({}, (tabs) => {
@@ -568,6 +592,45 @@ function safeSendToTab(tabId, message) {
       }
     });
   } catch {}
+}
+
+function shouldRunIntelligence() {
+  return (
+    session &&
+    session.active === true &&
+    session.paused !== true &&
+    session.mode === "FOCUS"
+  );
+}
+
+async function classifyIntentWithBackend(data = {}) {
+  if (!shouldRunIntelligence()) {
+    return {
+      alignment: "UNCLEAR",
+      confidence: 0,
+      reason: "Intelligence is disabled outside active focus sessions."
+    };
+  }
+
+  const response = await fetch("http://localhost:3001/classify-intent", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      focusGoal: data.focusGoal || session.focusGoal || "Focus Session",
+      pageType: data.pageType || "UNKNOWN",
+      title: data.title || "",
+      url: data.url || "",
+      domain: data.domain || ""
+    })
+  });
+
+  if (!response.ok) {
+    throw new Error(`AI backend returned ${response.status}`);
+  }
+
+  return response.json();
 }
 
 function getRemainingTime() {

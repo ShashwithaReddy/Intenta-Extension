@@ -63,9 +63,13 @@
   let lastUrl = location.href;
   let currentYouTubeContext = null;
   let lastYouTubeContextKey = null;
+  let lastAiClassifiedKey = null;
   let lastLoggedYouTubeTypeKey = null;
   let isYouTubeAwarenessActive = false;
   let titleRetryTimer = null;
+  let urlWatchInterval = null;
+  const ignoredAiUrls = new Set();
+  const shownAiUrls = new Set();
   const videoInterventionSuppressUntil = new Map();
   let videoInterventionRecheckTimer = null;
   const productiveKeywords = [
@@ -166,30 +170,139 @@
     return "OTHER";
   }
 
+  function getGenericPageContext() {
+    return {
+      pageType: "WEB_PAGE",
+      title: document.title || "",
+      url: location.href,
+      domain: location.hostname
+    };
+  }
+
+  function getYouTubeAiPageType(ytType) {
+    const pageTypes = {
+      HOME_FEED: "YOUTUBE_HOME_FEED",
+      SHORTS: "YOUTUBE_SHORTS",
+      SEARCH_RESULTS: "YOUTUBE_SEARCH_RESULTS",
+      WATCH_PAGE: "YOUTUBE_WATCH",
+      SUBSCRIPTIONS: "YOUTUBE_SUBSCRIPTIONS",
+      OTHER: "YOUTUBE_OTHER"
+    };
+
+    return pageTypes[ytType] || "YOUTUBE_OTHER";
+  }
+
+  function getPageContextForAi(ytType) {
+    if (ytType) {
+      return {
+        pageType: getYouTubeAiPageType(ytType),
+        title: document.title || "",
+        url: location.href,
+        domain: location.hostname
+      };
+    }
+
+    return getGenericPageContext();
+  }
+
+  function isUnsupportedPageUrl(url) {
+    return (
+      url.startsWith("chrome://") ||
+      url.startsWith("chrome-extension://") ||
+      url.startsWith("edge://") ||
+      url.startsWith("about:")
+    );
+  }
+
+  function isAllowedGoogleRedirectUrl(url) {
+    try {
+      const parsed = new URL(url);
+
+      return (
+        parsed.origin === "https://www.google.com" &&
+        (
+          parsed.pathname === "/" ||
+          parsed.pathname === "/webhp" ||
+          parsed.pathname === "/search"
+        )
+      );
+    } catch {
+      return false;
+    }
+  }
+
   function isFocusSessionActive(sessionState) {
     return (
       sessionState &&
       sessionState.active &&
+      sessionState.paused !== true &&
       sessionState.mode === "FOCUS"
     );
   }
 
-  function runYouTubeAwarenessIfFocus() {
-    safeSendMessage({ type: "GET_SESSION_STATE" }, (state) => {
-      if (!isFocusSessionActive(state)) {
-        clearYouTubeAwareness();
+  async function getSessionState() {
+    return sendMessageWithFallback({ type: "GET_SESSION_STATE" }, 1000);
+  }
+
+  async function shouldRunIntelligence() {
+    const state = await getSessionState();
+
+    return (
+      state &&
+      state.active === true &&
+      state.paused !== true &&
+      state.mode === "FOCUS"
+    );
+  }
+
+  function startIntelligenceUrlWatcher() {
+    if (urlWatchInterval) return;
+
+    urlWatchInterval = setInterval(async () => {
+      if (!(await shouldRunIntelligence())) {
+        clearIntelligenceState();
         return;
       }
 
-      isYouTubeAwarenessActive = true;
+      if (location.href !== lastUrl) {
+        lastUrl = location.href;
+        removeYouTubeInterventionOverlay();
+        clearYouTubeTitleRetry();
+        runYouTubeAwarenessIfFocus();
+      }
+    }, 1000);
+  }
 
-      const ytType = detectYouTubePageType();
+  function stopIntelligenceUrlWatcher() {
+    if (!urlWatchInterval) return;
 
-      logYouTubeType(ytType);
+    clearInterval(urlWatchInterval);
+    urlWatchInterval = null;
+  }
 
-      updateYouTubeContext(ytType);
-      maybeShowYouTubeIntervention(ytType, state);
-    });
+  async function runYouTubeAwarenessIfFocus() {
+    if (!(await shouldRunIntelligence())) {
+      clearIntelligenceState();
+      return;
+    }
+
+    const state = await getSessionState();
+
+    if (!isFocusSessionActive(state)) {
+      clearIntelligenceState();
+      return;
+    }
+
+    isYouTubeAwarenessActive = true;
+    startIntelligenceUrlWatcher();
+
+    const ytType = detectYouTubePageType();
+
+    logYouTubeType(ytType);
+
+    updateYouTubeContext(ytType);
+    maybeShowYouTubeIntervention(ytType, state);
+    maybeClassifyCurrentPageWithAi(state, ytType);
   }
 
   function clearYouTubeAwareness() {
@@ -198,6 +311,21 @@
     currentYouTubeContext = null;
     removeYouTubeInterventionOverlay();
     removeDistractionInterventionOverlay();
+  }
+
+  function clearIntelligenceState() {
+    clearYouTubeAwareness();
+    clearVideoInterventionSuppressions();
+    removeAiAwarenessOverlay();
+    stopIntelligenceUrlWatcher();
+    lastAiClassifiedKey = null;
+    lastYouTubeContextKey = null;
+    lastLoggedYouTubeTypeKey = null;
+  }
+
+  function resetAiAwarenessMemory() {
+    ignoredAiUrls.clear();
+    shownAiUrls.clear();
   }
 
   function isVideoInterventionSuppressed(url) {
@@ -226,9 +354,10 @@
       clearTimeout(videoInterventionRecheckTimer);
     }
 
-    videoInterventionRecheckTimer = setTimeout(() => {
+    videoInterventionRecheckTimer = setTimeout(async () => {
       videoInterventionRecheckTimer = null;
 
+      if (!(await shouldRunIntelligence())) return;
       if (location.href !== videoUrl) return;
 
       safeSendMessage({ type: "GET_SESSION_STATE" }, (state) => {
@@ -297,9 +426,14 @@
       return;
     }
 
-    safeSendMessage({ type: "GET_SESSION_STATE" }, (state) => {
+    safeSendMessage({ type: "GET_SESSION_STATE" }, async (state) => {
+      if (!(await shouldRunIntelligence())) {
+        clearIntelligenceState();
+        return;
+      }
+
       if (!isFocusSessionActive(state)) {
-        clearYouTubeAwareness();
+        clearIntelligenceState();
         return;
       }
 
@@ -313,6 +447,12 @@
         titleRetryTimer = null;
         if (updateAndLogYouTubeContext("WATCH_PAGE", location.href, title)) {
           console.log("Intenta YouTube Video:", title);
+          requestAiIntentAlignment(state.focusGoal, {
+            pageType: "YOUTUBE_WATCH",
+            title,
+            url: location.href,
+            domain: location.hostname
+          });
         }
         return;
       }
@@ -322,8 +462,9 @@
         return;
       }
 
-      titleRetryTimer = setTimeout(() => {
+      titleRetryTimer = setTimeout(async () => {
         titleRetryTimer = null;
+        if (!(await shouldRunIntelligence())) return;
         logYouTubeVideoTitleWithRetry(retries - 1);
       }, 500);
     });
@@ -399,6 +540,8 @@
   }
 
   function updateAndLogYouTubeContext(type, url, title) {
+    if (!isYouTubeAwarenessActive) return false;
+
     const key = getYouTubeContextKey(type, url, title);
 
     if (key === lastYouTubeContextKey) {
@@ -437,16 +580,46 @@
     return true;
   }
 
-  runYouTubeAwarenessIfFocus();
+  async function maybeClassifyCurrentPageWithAi(state, ytType) {
+    if (!(await shouldRunIntelligence())) return;
+    if (!isFocusSessionActive(state)) return;
+    if (isUnsupportedPageUrl(location.href)) return;
+    if (isAllowedGoogleRedirectUrl(location.href)) return;
+    if (ytType === "WATCH_PAGE") return;
 
-  setInterval(() => {
-    if (location.href !== lastUrl) {
-      lastUrl = location.href;
-      removeYouTubeInterventionOverlay();
-      clearYouTubeTitleRetry();
-      runYouTubeAwarenessIfFocus();
+    const pageContext = getPageContextForAi(ytType);
+
+    if (!pageContext.title && !pageContext.url) return;
+
+    requestAiIntentAlignment(state.focusGoal || "Focus Session", pageContext);
+  }
+
+  async function requestAiIntentAlignment(focusGoal, pageContext) {
+    if (!(await shouldRunIntelligence())) return;
+
+    const key = `${focusGoal || ""}|${location.href}|${document.title || ""}`;
+
+    if (key === lastAiClassifiedKey) {
+      return;
     }
-  }, 1000);
+
+    lastAiClassifiedKey = key;
+
+    safeSendMessage({
+      type: "AI_CLASSIFY_INTENT",
+      data: {
+        focusGoal: focusGoal || "Focus Session",
+        ...pageContext
+      }
+    }, async (result) => {
+      if (!(await shouldRunIntelligence())) return;
+      if (!result) return;
+      console.log("Intenta AI Alignment:", result);
+      maybeShowAiAwarenessOverlay(result, focusGoal || "Focus Session");
+    });
+  }
+
+  runYouTubeAwarenessIfFocus();
 
   function safeSendMessage(message, callback) {
     try {
@@ -528,7 +701,109 @@
     }, 1600);
   }
 
-  function showDistractionIntervention(url, title, score) {
+  async function maybeShowAiAwarenessOverlay(result, focusGoal) {
+    if (!(await shouldRunIntelligence())) return;
+    if (!result || result.alignment !== "NOT_ALIGNED") return;
+    if (Number(result.confidence) < 0.8) return;
+
+    const urlKey = location.href;
+
+    if (ignoredAiUrls.has(urlKey) || shownAiUrls.has(urlKey)) {
+      return;
+    }
+
+    shownAiUrls.add(urlKey);
+
+    showAiAwarenessOverlay({
+      goal: focusGoal,
+      reason: result.reason || "This content appears unrelated to your focus."
+    });
+  }
+
+  function showAiAwarenessOverlay({ goal, reason }) {
+    removeAiAwarenessOverlay();
+
+    const overlay = document.createElement("div");
+    overlay.id = "intenta-ai-awareness-overlay";
+
+    overlay.style = `
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.72);
+      z-index: 2147483647;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      animation: intentaOverlayFadeIn 180ms ease-out;
+    `;
+
+    overlay.innerHTML = `
+      <div style="
+        width: calc(100% - 32px);
+        max-width: 420px;
+        background: #111;
+        color: white;
+        padding: 24px;
+        border-radius: 16px;
+        text-align: center;
+        line-height: 1.45;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 12px;
+        box-shadow: 0 20px 50px rgba(0,0,0,0.4);
+      ">
+        <p style="font-size:22px;font-weight:700;">🤔 Pause for a second</p>
+        <p style="font-size:14px;opacity:0.84;">This content doesn't appear related to:</p>
+        <p style="font-size:15px;font-weight:700;">"${goal || "Focus Session"}"</p>
+        <div style="
+          width: 100%;
+          background: #181818;
+          border: 1px solid #333;
+          border-radius: 12px;
+          padding: 12px;
+          text-align: left;
+          font-size: 13px;
+          color: rgba(255,255,255,0.82);
+        ">
+          <strong>AI reason:</strong><br />
+          ${reason}
+        </div>
+        <p style="font-size:14px;font-weight:600;">Continue intentionally?</p>
+        <button id="aiContinue">Continue</button>
+        <button id="aiLeave">Leave</button>
+      </div>
+    `;
+
+    shadow.appendChild(overlay);
+    styleOverlayButtons(overlay);
+
+    shadow.getElementById("aiContinue").addEventListener("click", () => {
+      ignoredAiUrls.add(location.href);
+      overlay.remove();
+    });
+
+    shadow.getElementById("aiLeave").addEventListener("click", () => {
+      overlay.remove();
+
+      if (detectYouTubePageType() === "SHORTS") {
+        window.history.back();
+        return;
+      }
+
+      window.location.href = "https://www.google.com";
+    });
+  }
+
+  function removeAiAwarenessOverlay() {
+    const overlay = shadow.getElementById("intenta-ai-awareness-overlay");
+    if (overlay) overlay.remove();
+  }
+
+  async function showDistractionIntervention(url, title, score) {
+    if (!(await shouldRunIntelligence())) return;
+
     if (
       isVideoInterventionSuppressed(url) ||
       shadow.getElementById("intenta-distraction-overlay") ||
@@ -598,9 +873,14 @@
     if (overlay) overlay.remove();
   }
 
-  function maybeShowYouTubeIntervention(type, sessionState) {
+  async function maybeShowYouTubeIntervention(type, sessionState) {
+    if (!(await shouldRunIntelligence())) {
+      clearIntelligenceState();
+      return;
+    }
+
     if (!isFocusSessionActive(sessionState)) {
-      clearYouTubeAwareness();
+      clearIntelligenceState();
       return;
     }
 
@@ -757,7 +1037,8 @@
     }
 
     if (message.type === "SESSION_COMPLETE") {
-      clearVideoInterventionSuppressions();
+      resetAiAwarenessMemory();
+      clearIntelligenceState();
       clearIntentaOverlays();
       showCelebrationOverlay(message.summary);
       renderSessionState();
@@ -969,7 +1250,8 @@
     });
 
     withButtonFeedback(shadow.getElementById("start"), async () => {
-      clearVideoInterventionSuppressions();
+      resetAiAwarenessMemory();
+      clearIntelligenceState();
       const focusGoal = shadow.getElementById("focusGoal").value.trim();
       lastFocusGoalInput = focusGoal;
       const cycles = Number(shadow.getElementById("cycles").value);
@@ -992,13 +1274,15 @@
 
     withButtonFeedback(shadow.getElementById("stop"), async () => {
       await sendMessageWithFallback({ type: "STOP_SESSION" });
-      clearVideoInterventionSuppressions();
+      resetAiAwarenessMemory();
+      clearIntelligenceState();
       renderSessionState();
       stopSessionStateUpdates();
     }, "Session stopped");
 
     withButtonFeedback(shadow.getElementById("pause"), async () => {
       await sendMessageWithFallback({ type: "PAUSE_SESSION" });
+      clearIntelligenceState();
       clearPauseOverlays();
       renderSessionState();
     }, "Session paused");
@@ -1090,6 +1374,8 @@
     const ytLeave = container.querySelector("#ytLeave");
     const ytDistractionContinue = container.querySelector("#ytDistractionContinue");
     const ytDistractionLeave = container.querySelector("#ytDistractionLeave");
+    const aiContinue = container.querySelector("#aiContinue");
+    const aiLeave = container.querySelector("#aiLeave");
 
     if (add) add.style.cssText = `${buttonBaseStyle} background: #22c55e; color: white;`;
     if (back) back.style.cssText = `${buttonBaseStyle} background: #222; color: white;`;
@@ -1102,6 +1388,8 @@
     if (ytLeave) ytLeave.style.cssText = `${buttonBaseStyle} background: #ef4444; color: white;`;
     if (ytDistractionContinue) ytDistractionContinue.style.cssText = `${buttonBaseStyle} background: #22c55e; color: white;`;
     if (ytDistractionLeave) ytDistractionLeave.style.cssText = `${buttonBaseStyle} background: #ef4444; color: white;`;
+    if (aiContinue) aiContinue.style.cssText = `${buttonBaseStyle} background: #22c55e; color: white;`;
+    if (aiLeave) aiLeave.style.cssText = `${buttonBaseStyle} background: #ef4444; color: white;`;
   }
 
   function startSessionStateUpdates() {
@@ -1168,8 +1456,7 @@
       if (isFocus) {
         runYouTubeAwarenessIfFocus();
       } else {
-        if (!isActive) clearVideoInterventionSuppressions();
-        clearYouTubeAwareness();
+        clearIntelligenceState();
       }
 
       if (config) config.style.display = isActive ? "none" : "flex";
@@ -1208,6 +1495,7 @@
       "#intenta-block-overlay",
       "#intenta-youtube-overlay",
       "#intenta-distraction-overlay",
+      "#intenta-ai-awareness-overlay",
       "#intenta-celebration-overlay",
       "#intenta-history-modal",
       "#intenta-panel",
@@ -1241,6 +1529,7 @@
       "#intenta-block-overlay",
       "#intenta-youtube-overlay",
       "#intenta-distraction-overlay",
+      "#intenta-ai-awareness-overlay",
       "#intenta-celebration-overlay",
       "#intenta-history-modal",
       "#intenta-toast"
