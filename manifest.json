@@ -11,7 +11,8 @@
   ],
 
   "host_permissions": [
-    "<all_urls>"
+    "<all_urls>",
+    "https://intenta-api-6z5q.onrender.com/*"
   ],
 
   "background": {
