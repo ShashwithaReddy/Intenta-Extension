@@ -1,0 +1,19 @@
+{
+  "name": "intenta-ai-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^4.18.3",
+    "express-rate-limit": "^8.5.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14"
+  }
+}
