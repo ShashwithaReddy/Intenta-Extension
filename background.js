@@ -15,10 +15,13 @@ let session = {
   currentCycle: 0,
   totalCycles: 0,
   focusGoal: "",
+  aiEnabled: false,
   warned5: false,
   distractionsClosed: 0,
   sitesAdded: 0,
-  addedDomains: new Set()
+  addedDomains: new Set(),
+  aiReflections: [],
+  focusQuality: createFocusQuality()
 };
 
 const DEFAULT_FOCUS_MINUTES = 50;
@@ -48,7 +51,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       Number.isFinite(message.data?.cycles) && message.data.cycles > 0
         ? message.data.cycles
         : DEFAULT_CYCLES;
-    const focusGoal = message.data?.focusGoal?.trim() || "Focus Session";
+    const focusGoal = message.data?.focusGoal?.trim() || "";
+    const aiEnabled = message.data?.aiEnabled !== false && Boolean(focusGoal);
 
     session.active = true;
     session.mode = "FOCUS";
@@ -63,12 +67,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     session.totalCycles = Math.floor(cycles);
     session.currentCycle = 1;
     session.focusGoal = focusGoal;
+    session.aiEnabled = aiEnabled;
     session.duration = session.focusDuration;
     session.warned5 = false;
     session.distractionsClosed = 0;
     session.sitesAdded = 0;
     session.addedDomains = new Set();
+    session.aiReflections = [];
+    session.focusQuality = createFocusQuality();
     persistSessionState();
+    broadcast({ type: "SESSION_STARTED" });
+    broadcastSessionStateUpdated();
 
     console.log("Focus session started");
   }
@@ -79,6 +88,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     stopSessionState();
 
     chrome.storage.local.remove(["allowedSites"], () => {
+      broadcast({ type: "SESSION_STOPPED" });
+      broadcastSessionStateUpdated();
       console.log("Session cleared");
     });
 
@@ -89,6 +100,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   else if (message.type === "PAUSE_SESSION") {
     if (session.active && !session.paused) {
       const remainingAtPause = getRemainingTime();
+      flushFocusQualityContext();
 
       session.paused = true;
       session.pausedAt = Date.now();
@@ -96,6 +108,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       session.previousModeBeforePause = session.mode;
       session.mode = "PAUSED";
       persistSessionState();
+      broadcastSessionStateUpdated();
     }
   }
 
@@ -111,6 +124,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       session.previousModeBeforePause = null;
       session.warned5 = false;
       persistSessionState();
+      broadcastSessionStateUpdated();
 
       if (session.mode === "FOCUS") {
         evaluateAllTabs();
@@ -171,17 +185,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       currentCycle: session.currentCycle,
       totalCycles: session.totalCycles,
       focusGoal: session.focusGoal || "",
+      aiEnabled: session.aiEnabled === true,
       focusMinutes: session.focusDuration / 60 / 1000,
       breakMinutes: session.breakDuration / 60 / 1000
     });
   }
 
   // 🔹 SET ALLOWED SITES
-  else if (message.type === "SET_ALLOWED_SITES") {
+  else if (message.type === "SET_ALLOWED_SITES" || message.type === "UPDATE_ALLOWED_SITES") {
     const domains = message.data.domains;
     const uniqueDomains = [...new Set(domains)];
 
-    chrome.storage.local.set({ allowedSites: uniqueDomains });
+    chrome.storage.local.set({ allowedSites: uniqueDomains }, () => {
+      broadcastSessionStateUpdated();
+    });
   }
 
   // 🔹 ADD DOMAIN
@@ -198,6 +215,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           trackAddedDomain(domain);
         }
         persistSessionState();
+        broadcastSessionStateUpdated();
         sendResponse({ success: true });
       });
     });
@@ -232,6 +250,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         chrome.storage.local.set({ allowedSites: updated }, () => {
           newlyAddedDomains.forEach(trackAddedDomain);
           persistSessionState();
+          broadcastSessionStateUpdated();
         });
       });
     });
@@ -263,6 +282,51 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   else if (message.type === "DISTRACTION_CLOSED") {
     session.distractionsClosed = (session.distractionsClosed || 0) + 1;
     persistSessionState();
+  }
+
+  // 🔹 SAVE AI REFLECTION
+  else if (message.type === "SAVE_AI_REFLECTION") {
+    if (!shouldRunIntelligence()) {
+      sendResponse({ success: false });
+      return;
+    }
+
+    if (!Array.isArray(session.aiReflections)) {
+      session.aiReflections = [];
+    }
+
+    session.aiReflections.push({
+      url: message.data?.url || "",
+      title: message.data?.title || "",
+      focusGoal: message.data?.focusGoal || session.focusGoal || "",
+      reason: message.data?.reason || "Skip",
+      aiAlignment: message.data?.aiAlignment || "",
+      aiConfidence: message.data?.aiConfidence ?? 0,
+      aiReason: message.data?.aiReason || "",
+      timestamp: message.data?.timestamp || Date.now()
+    });
+
+    updateFocusQualityReflection(message.data?.url, message.data?.reason);
+    persistSessionState();
+    sendResponse({ success: true });
+  }
+
+  // 🔹 RECORD AI FOCUS QUALITY CONTEXT
+  else if (message.type === "RECORD_AI_FOCUS_CONTEXT") {
+    if (!shouldRunIntelligence()) {
+      sendResponse({ success: false });
+      return;
+    }
+
+    recordFocusQualityContext(message.data || {});
+    sendResponse({ success: true });
+  }
+
+  // 🔹 FLUSH FOCUS QUALITY CONTEXT
+  else if (message.type === "FLUSH_FOCUS_QUALITY_CONTEXT") {
+    flushFocusQualityContext();
+    persistSessionState();
+    sendResponse({ success: true });
   }
 
   // 🔹 AI INTENT ALIGNMENT (proxy through local backend)
@@ -412,19 +476,25 @@ function syncSessionState() {
   session.warned5 = false;
 
   if (session.mode === "FOCUS") {
+    flushFocusQualityContext();
     session.mode = "BREAK";
     session.duration = session.breakDuration;
     persistSessionState();
+    broadcastSessionStateUpdated();
   } else if (session.mode === "BREAK") {
     if (session.currentCycle >= session.totalCycles) {
+      flushFocusQualityContext();
       const summary = buildSessionSummary();
       saveSessionHistory(summary);
       broadcast({
         type: "SESSION_COMPLETE",
         summary
       });
+      broadcast({ type: "SESSION_COMPLETED" });
       stopSessionState();
-      chrome.storage.local.remove(["allowedSites"]);
+      chrome.storage.local.remove(["allowedSites"], () => {
+        broadcastSessionStateUpdated();
+      });
       return;
     }
 
@@ -432,6 +502,7 @@ function syncSessionState() {
     session.mode = "FOCUS";
     session.duration = session.focusDuration;
     persistSessionState();
+    broadcastSessionStateUpdated();
     evaluateAllTabs();
   }
 }
@@ -451,10 +522,13 @@ function stopSessionState() {
   session.currentCycle = 0;
   session.totalCycles = 0;
   session.focusGoal = "";
+  session.aiEnabled = false;
   session.warned5 = false;
   session.distractionsClosed = 0;
   session.sitesAdded = 0;
   session.addedDomains = new Set();
+  session.aiReflections = [];
+  session.focusQuality = createFocusQuality();
   persistSessionState();
 }
 
@@ -487,6 +561,155 @@ function formatDuration(minutesFloat) {
   return `${minutesFloat.toFixed(1)} min`;
 }
 
+function createFocusQuality() {
+  return {
+    alignedSeconds: 0,
+    possiblyRelatedSeconds: 0,
+    backgroundSeconds: 0,
+    notAlignedSeconds: 0,
+    unclearSeconds: 0,
+    intentionalContinueSeconds: 0,
+    distractedContinueSeconds: 0,
+    aiEvents: [],
+    currentContext: null
+  };
+}
+
+function ensureFocusQuality() {
+  if (!session.focusQuality) {
+    session.focusQuality = createFocusQuality();
+  }
+
+  [
+    "alignedSeconds",
+    "possiblyRelatedSeconds",
+    "backgroundSeconds",
+    "notAlignedSeconds",
+    "unclearSeconds",
+    "intentionalContinueSeconds",
+    "distractedContinueSeconds"
+  ].forEach((key) => {
+    if (!Number.isFinite(session.focusQuality[key])) {
+      session.focusQuality[key] = 0;
+    }
+  });
+
+  if (!Array.isArray(session.focusQuality.aiEvents)) {
+    session.focusQuality.aiEvents = [];
+  }
+
+  return session.focusQuality;
+}
+
+function recordFocusQualityContext(context) {
+  if (!shouldRunIntelligence()) return;
+
+  const focusQuality = ensureFocusQuality();
+  const now = Date.now();
+
+  flushFocusQualityContext(now);
+
+  focusQuality.currentContext = {
+    url: context.url || "",
+    title: context.title || "",
+    domain: context.domain || "",
+    alignment: context.alignment || "UNCLEAR",
+    confidence: context.confidence ?? 0,
+    reason: context.reason || "",
+    reflectionReason: null,
+    continueCategory: null,
+    startedAt: now
+  };
+
+  focusQuality.aiEvents.push({
+    url: focusQuality.currentContext.url,
+    title: focusQuality.currentContext.title,
+    domain: focusQuality.currentContext.domain,
+    alignment: focusQuality.currentContext.alignment,
+    confidence: focusQuality.currentContext.confidence,
+    reason: focusQuality.currentContext.reason,
+    startedAt: now
+  });
+
+  persistSessionState();
+}
+
+function updateFocusQualityReflection(url, reflectionReason) {
+  const focusQuality = ensureFocusQuality();
+  const context = focusQuality.currentContext;
+
+  if (!context || context.url !== url) return;
+
+  context.reflectionReason = reflectionReason || "Skip";
+
+  if (reflectionReason === "Needed for my work") {
+    context.continueCategory = "intentional";
+  } else if (
+    reflectionReason === "Just curious" ||
+    reflectionReason === "I got distracted" ||
+    reflectionReason === "Skip" ||
+    !reflectionReason
+  ) {
+    context.continueCategory = "distracted";
+  } else {
+    context.continueCategory = null;
+  }
+}
+
+function flushFocusQualityContext(endedAt = Date.now()) {
+  const focusQuality = ensureFocusQuality();
+  const context = focusQuality.currentContext;
+
+  if (!context) return;
+
+  if (session.active && !session.paused && session.mode === "FOCUS") {
+    const elapsedSeconds = Math.max((endedAt - context.startedAt) / 1000, 0);
+    addFocusQualitySeconds(context, elapsedSeconds);
+  }
+
+  focusQuality.currentContext = null;
+}
+
+function addFocusQualitySeconds(context, elapsedSeconds) {
+  const focusQuality = ensureFocusQuality();
+
+  if (context.alignment === "ALIGNED") {
+    focusQuality.alignedSeconds += elapsedSeconds;
+  } else if (context.alignment === "POSSIBLY_RELATED") {
+    focusQuality.possiblyRelatedSeconds += elapsedSeconds;
+  } else if (context.alignment === "ALLOWED_BACKGROUND") {
+    focusQuality.backgroundSeconds += elapsedSeconds;
+  } else if (context.alignment === "NOT_ALIGNED") {
+    focusQuality.notAlignedSeconds += elapsedSeconds;
+  } else {
+    focusQuality.unclearSeconds += elapsedSeconds;
+  }
+
+  if (context.continueCategory === "intentional") {
+    focusQuality.intentionalContinueSeconds += elapsedSeconds;
+  } else if (context.continueCategory === "distracted") {
+    focusQuality.distractedContinueSeconds += elapsedSeconds;
+  }
+}
+
+function secondsToMinutes(seconds) {
+  return Math.round((seconds / 60) * 10) / 10;
+}
+
+function buildFocusQualitySummary() {
+  const focusQuality = ensureFocusQuality();
+
+  return {
+    alignedMinutes: secondsToMinutes(focusQuality.alignedSeconds || 0),
+    possiblyRelatedMinutes: secondsToMinutes(focusQuality.possiblyRelatedSeconds || 0),
+    backgroundMinutes: secondsToMinutes(focusQuality.backgroundSeconds || 0),
+    notAlignedMinutes: secondsToMinutes(focusQuality.notAlignedSeconds || 0),
+    unclearMinutes: secondsToMinutes(focusQuality.unclearSeconds || 0),
+    intentionalContinueMinutes: secondsToMinutes(focusQuality.intentionalContinueSeconds || 0),
+    distractedContinueMinutes: secondsToMinutes(focusQuality.distractedContinueSeconds || 0)
+  };
+}
+
 function buildSessionSummary() {
   const focusMinutes =
     ((session.focusDuration || 0) *
@@ -501,6 +724,7 @@ function buildSessionSummary() {
     status: "COMPLETED",
     completedAt: Date.now(),
     focusGoal: session.focusGoal || "",
+    aiEnabled: session.aiEnabled === true,
     cyclesCompleted: session.totalCycles || session.currentCycle || 0,
     totalCycles: session.totalCycles || 0,
     focusMinutes,
@@ -508,7 +732,10 @@ function buildSessionSummary() {
     focusTimeFormatted: formatDuration(focusMinutes),
     breakTimeFormatted: formatDuration(breakMinutes),
     distractionsClosed: session.distractionsClosed || 0,
-    sitesAdded: session.sitesAdded || 0
+    sitesAdded: session.sitesAdded || 0,
+    aiReflections: session.aiReflections || [],
+    aiReflectionsCount: (session.aiReflections || []).length,
+    focusQuality: buildFocusQualitySummary()
   };
 }
 
@@ -532,6 +759,8 @@ function saveStoppedSession() {
     return;
   }
 
+  flushFocusQualityContext();
+
   const elapsedMinutes =
     (Date.now() - session.sessionStartTime) / (1000 * 60);
 
@@ -544,11 +773,15 @@ function saveStoppedSession() {
     status: "STOPPED_EARLY",
     completedAt: new Date().toISOString(),
     focusGoal: session.focusGoal,
+    aiEnabled: session.aiEnabled === true,
     completedCycles: Math.max((session.currentCycle || 0) - 1, 0),
     totalCycles: session.totalCycles,
     focusMinutesSpent: Math.round(elapsedMinutes),
     sitesAdded: session.sitesAdded || 0,
-    distractionsClosed: session.distractionsClosed || 0
+    distractionsClosed: session.distractionsClosed || 0,
+    aiReflections: session.aiReflections || [],
+    aiReflectionsCount: (session.aiReflections || []).length,
+    focusQuality: buildFocusQualitySummary()
   };
 
   addToSessionHistory(historyItem);
@@ -557,7 +790,9 @@ function saveStoppedSession() {
 function serializeSessionState() {
   return {
     ...session,
-    addedDomains: [...session.addedDomains]
+    addedDomains: [...session.addedDomains],
+    aiReflections: session.aiReflections || [],
+    focusQuality: session.focusQuality || createFocusQuality()
   };
 }
 
@@ -566,7 +801,12 @@ function restoreSessionState(savedSession) {
     ...session,
     ...savedSession,
     focusGoal: savedSession.focusGoal || "",
-    addedDomains: new Set(savedSession.addedDomains || [])
+    aiEnabled: savedSession.aiEnabled === undefined
+      ? Boolean(savedSession.focusGoal)
+      : savedSession.aiEnabled === true,
+    addedDomains: new Set(savedSession.addedDomains || []),
+    aiReflections: savedSession.aiReflections || [],
+    focusQuality: savedSession.focusQuality || createFocusQuality()
   };
 }
 
@@ -584,6 +824,10 @@ function broadcast(message) {
   });
 }
 
+function broadcastSessionStateUpdated() {
+  broadcast({ type: "SESSION_STATE_UPDATED" });
+}
+
 function safeSendToTab(tabId, message) {
   try {
     chrome.tabs.sendMessage(tabId, message, () => {
@@ -598,6 +842,7 @@ function shouldRunIntelligence() {
   return (
     session &&
     session.active === true &&
+    session.aiEnabled === true &&
     session.paused !== true &&
     session.mode === "FOCUS"
   );

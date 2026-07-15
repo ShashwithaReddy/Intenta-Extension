@@ -63,13 +63,24 @@
   let lastUrl = location.href;
   let currentYouTubeContext = null;
   let lastYouTubeContextKey = null;
-  let lastAiClassifiedKey = null;
   let lastLoggedYouTubeTypeKey = null;
   let isYouTubeAwarenessActive = false;
   let titleRetryTimer = null;
+  let aiTitleRetryTimer = null;
+  let aiTitleRetryCount = 0;
+  let lastProcessedAiPageKey = null;
   let urlWatchInterval = null;
-  const ignoredAiUrls = new Set();
-  const shownAiUrls = new Set();
+  const AI_CLASSIFICATION_CACHE_TTL = 10 * 60 * 1000;
+  const aiClassificationCache = new Map();
+  const aiInFlightRequests = new Map();
+  const aiInterventionState = new Map();
+  const aiInterventionTimers = new Map();
+  const temporaryApprovals = new Map();
+  const aiSuppressionUntilByScope = temporaryApprovals;
+  const TEMPORARY_APPROVAL_MINUTES = 3;
+  let lastAwarenessRefreshAt = 0;
+  let awarenessRefreshPromise = null;
+  let aiAutoResumeTimer = null;
   const videoInterventionSuppressUntil = new Map();
   let videoInterventionRecheckTimer = null;
   const productiveKeywords = [
@@ -205,6 +216,78 @@
     return getGenericPageContext();
   }
 
+  function normalizeUrlForAiCache(url) {
+    try {
+      const parsed = new URL(url);
+
+      if (parsed.hostname.includes("youtube.com") && parsed.pathname === "/watch") {
+        const videoId = parsed.searchParams.get("v");
+        return videoId ? `youtube:watch:${videoId}` : parsed.href;
+      }
+
+      if (parsed.hostname.includes("youtube.com") && parsed.pathname.startsWith("/shorts/")) {
+        return `youtube:shorts:${parsed.pathname}`;
+      }
+
+      parsed.search = "";
+      parsed.hash = "";
+
+      return `${parsed.hostname}${parsed.pathname}`;
+    } catch {
+      return url;
+    }
+  }
+
+  function buildAiCacheKey({ focusGoal, pageType, title, url, domain }) {
+    return JSON.stringify({
+      focusGoal: (focusGoal || "").trim().toLowerCase(),
+      pageType,
+      domain,
+      title: (title || "").trim().toLowerCase(),
+      url: normalizeUrlForAiCache(url)
+    });
+  }
+
+  function getBestPageTitle() {
+    if (location.hostname.includes("youtube.com")) {
+      const ytTitle =
+        currentYouTubeContext?.title ||
+        document.querySelector("h1.ytd-watch-metadata")?.innerText?.trim() ||
+        document.querySelector("h1.title")?.innerText?.trim();
+
+      if (ytTitle && ytTitle !== "YouTube") {
+        return ytTitle;
+      }
+    }
+
+    return document.title?.trim() || "";
+  }
+
+  function buildAiPageKey(payload) {
+    return JSON.stringify({
+      focusGoal: payload.focusGoal,
+      pageType: payload.pageType,
+      domain: payload.domain,
+      url: normalizeUrlForAiCache(payload.url),
+      title: payload.title
+    });
+  }
+
+  function retryAiWhenTitleReady() {
+    if (aiTitleRetryCount >= 5) {
+      console.log("Intenta AI skipped: title unavailable after retries");
+      aiTitleRetryCount = 0;
+      return;
+    }
+
+    clearTimeout(aiTitleRetryTimer);
+
+    aiTitleRetryTimer = setTimeout(() => {
+      aiTitleRetryCount++;
+      runPageAwarenessIfFocus();
+    }, 1000);
+  }
+
   function isUnsupportedPageUrl(url) {
     return (
       url.startsWith("chrome://") ||
@@ -250,6 +333,7 @@
     return (
       state &&
       state.active === true &&
+      state.aiEnabled === true &&
       state.paused !== true &&
       state.mode === "FOCUS"
     );
@@ -265,10 +349,13 @@
       }
 
       if (location.href !== lastUrl) {
+        safeSendMessage({ type: "FLUSH_FOCUS_QUALITY_CONTEXT" });
         lastUrl = location.href;
+        lastProcessedAiPageKey = null;
+        aiTitleRetryCount = 0;
         removeYouTubeInterventionOverlay();
         clearYouTubeTitleRetry();
-        runYouTubeAwarenessIfFocus();
+        runPageAwarenessIfFocus();
       }
     }, 1000);
   }
@@ -305,27 +392,102 @@
     maybeClassifyCurrentPageWithAi(state, ytType);
   }
 
+  async function runPageAwarenessIfFocus() {
+    return runYouTubeAwarenessIfFocus();
+  }
+
   function clearYouTubeAwareness() {
     isYouTubeAwarenessActive = false;
     clearYouTubeTitleRetry();
     currentYouTubeContext = null;
     removeYouTubeInterventionOverlay();
     removeDistractionInterventionOverlay();
+    removeAiFollowupOverlay();
   }
 
   function clearIntelligenceState() {
     clearYouTubeAwareness();
     clearVideoInterventionSuppressions();
     removeAiAwarenessOverlay();
+    removeAiReflectionOverlay();
     stopIntelligenceUrlWatcher();
-    lastAiClassifiedKey = null;
     lastYouTubeContextKey = null;
     lastLoggedYouTubeTypeKey = null;
+    lastProcessedAiPageKey = null;
+    aiTitleRetryCount = 0;
+    clearTimeout(aiTitleRetryTimer);
+    aiTitleRetryTimer = null;
+  }
+
+  function resetAiRuntimeState() {
+    lastProcessedAiPageKey = null;
+    aiTitleRetryCount = 0;
+
+    if (aiTitleRetryTimer) {
+      clearTimeout(aiTitleRetryTimer);
+      aiTitleRetryTimer = null;
+    }
+
+    aiClassificationCache.clear();
+    aiInFlightRequests.forEach((timer) => clearTimeout(timer));
+    aiInFlightRequests.clear();
+    aiSuppressionUntilByScope.clear();
+    aiInterventionState.clear();
+    aiInterventionTimers.forEach((timer) => clearTimeout(timer));
+    aiInterventionTimers.clear();
+    currentYouTubeContext = null;
+    lastYouTubeContextKey = null;
+    lastLoggedYouTubeTypeKey = null;
+
+    if (aiAutoResumeTimer) {
+      clearTimeout(aiAutoResumeTimer);
+      aiAutoResumeTimer = null;
+    }
+
+    console.log("Intenta AI runtime state reset");
   }
 
   function resetAiAwarenessMemory() {
-    ignoredAiUrls.clear();
-    shownAiUrls.clear();
+    resetAiRuntimeState();
+  }
+
+  function getTemporaryApprovalKeys(url = location.href) {
+    const keys = [`url:${normalizeUrlForAiCache(url)}`];
+
+    try {
+      keys.push(`domain:${new URL(url).hostname}`);
+    } catch {}
+
+    return keys;
+  }
+
+  function grantTemporaryApproval(url = location.href, minutes = TEMPORARY_APPROVAL_MINUTES) {
+    const expiresAt = Date.now() + minutes * 60 * 1000;
+
+    getTemporaryApprovalKeys(url).forEach((key) => {
+      temporaryApprovals.set(key, { expiresAt });
+    });
+
+    lastProcessedAiPageKey = null;
+    removeBlockedOverlay();
+  }
+
+  function hasTemporaryApproval(url = location.href) {
+    const now = Date.now();
+
+    return getTemporaryApprovalKeys(url).some((key) => {
+      const approval = temporaryApprovals.get(key);
+
+      if (!approval) return false;
+
+      if (approval.expiresAt <= now) {
+        temporaryApprovals.delete(key);
+        lastProcessedAiPageKey = null;
+        return false;
+      }
+
+      return true;
+    });
   }
 
   function isVideoInterventionSuppressed(url) {
@@ -396,7 +558,7 @@
       const el = document.querySelector(selector);
       const text = el?.textContent?.trim();
 
-      if (text) return text;
+      if (text && text !== "YouTube") return text;
     }
 
     return null;
@@ -585,6 +747,7 @@
     if (!isFocusSessionActive(state)) return;
     if (isUnsupportedPageUrl(location.href)) return;
     if (isAllowedGoogleRedirectUrl(location.href)) return;
+    if (hasTemporaryApproval(location.href)) return;
     if (ytType === "WATCH_PAGE") return;
 
     const pageContext = getPageContextForAi(ytType);
@@ -596,27 +759,106 @@
 
   async function requestAiIntentAlignment(focusGoal, pageContext) {
     if (!(await shouldRunIntelligence())) return;
+    if (hasTemporaryApproval(pageContext?.url || location.href)) return;
 
-    const key = `${focusGoal || ""}|${location.href}|${document.title || ""}`;
+    const title = getBestPageTitle();
 
-    if (key === lastAiClassifiedKey) {
+    if (!title || title === "YouTube") {
+      console.log("Intenta AI skipped: title not ready", {
+        url: location.href,
+        title
+      });
+      retryAiWhenTitleReady();
       return;
     }
 
-    lastAiClassifiedKey = key;
+    const payload = {
+      focusGoal: focusGoal || "Focus Session",
+      ...pageContext,
+      title
+    };
+    const pageKey = buildAiPageKey(payload);
+
+    if (pageKey === lastProcessedAiPageKey) {
+      console.log("Intenta AI skipped: page already processed");
+      return;
+    }
+
+    lastProcessedAiPageKey = pageKey;
+    aiTitleRetryCount = 0;
+
+    const cacheKey = buildAiCacheKey(payload);
+    const cached = aiClassificationCache.get(cacheKey);
+
+    if (cached && Date.now() < cached.expiresAt) {
+      console.log("Intenta AI Cache Hit:", cached.result);
+      await handleAiResult(cached.result, payload);
+      lastProcessedAiPageKey = null;
+      return;
+    }
+
+    if (aiInFlightRequests.has(cacheKey)) {
+      console.log("Intenta AI request already in-flight:", cacheKey);
+      return;
+    }
+
+    console.log("Intenta AI Payload:", payload);
+
+    const inFlightCleanupTimer = setTimeout(() => {
+      aiInFlightRequests.delete(cacheKey);
+    }, 30000);
+
+    aiInFlightRequests.set(cacheKey, inFlightCleanupTimer);
 
     safeSendMessage({
       type: "AI_CLASSIFY_INTENT",
-      data: {
-        focusGoal: focusGoal || "Focus Session",
-        ...pageContext
-      }
+      data: payload
     }, async (result) => {
-      if (!(await shouldRunIntelligence())) return;
+      clearTimeout(inFlightCleanupTimer);
+      aiInFlightRequests.delete(cacheKey);
+
       if (!result) return;
-      console.log("Intenta AI Alignment:", result);
-      maybeShowAiAwarenessOverlay(result, focusGoal || "Focus Session");
+
+      if (
+        !payload.title ||
+        payload.title === "YouTube" ||
+        result.alignment === "UNCLEAR"
+      ) {
+        console.log("Intenta AI result not cached due to weak context", {
+          title: payload.title,
+          result
+        });
+      } else {
+        aiClassificationCache.set(cacheKey, {
+          result,
+          expiresAt: Date.now() + AI_CLASSIFICATION_CACHE_TTL
+        });
+        console.log("Intenta AI Cache Stored:", result);
+      }
+
+      await handleAiResult(result, payload);
     });
+  }
+
+  async function handleAiResult(result, payload) {
+    if (!(await shouldRunIntelligence())) return;
+    if (payload.url !== location.href) return;
+    if (hasTemporaryApproval(payload.url)) return;
+
+    console.log("Intenta AI Alignment:", result);
+    safeSendMessage({
+      type: "RECORD_AI_FOCUS_CONTEXT",
+      data: {
+        url: payload.url,
+        title: payload.title,
+        domain: payload.domain,
+        alignment: result.alignment,
+        confidence: result.confidence,
+        reason: result.reason,
+        startedAt: Date.now()
+      }
+    });
+    maybeShowAiAwarenessOverlay(result, payload.focusGoal || "Focus Session", payload);
   }
 
   runYouTubeAwarenessIfFocus();
@@ -660,8 +902,8 @@
       }, 120);
 
       try {
-        await action();
-        if (successText) showToast(successText);
+        const result = await action();
+        if (successText && result !== false) showToast(successText);
       } finally {
         setTimeout(() => {
           button.disabled = false;
@@ -701,26 +943,49 @@
     }, 1600);
   }
 
-  async function maybeShowAiAwarenessOverlay(result, focusGoal) {
+  async function maybeShowAiAwarenessOverlay(result, focusGoal, pageContext) {
     if (!(await shouldRunIntelligence())) return;
     if (!result || result.alignment !== "NOT_ALIGNED") return;
     if (Number(result.confidence) < 0.8) return;
+    if (hasTemporaryApproval(pageContext?.url || location.href)) return;
 
     const urlKey = location.href;
+    const state = aiInterventionState.get(urlKey);
+    const now = Date.now();
 
-    if (ignoredAiUrls.has(urlKey) || shownAiUrls.has(urlKey)) {
+    if (state?.cooldownUntil && state.cooldownUntil > now) {
       return;
     }
 
-    shownAiUrls.add(urlKey);
+    if (
+      shadow.getElementById("intenta-ai-awareness-overlay") ||
+      shadow.getElementById("intenta-ai-reflection-overlay") ||
+      shadow.getElementById("intenta-ai-followup-overlay")
+    ) {
+      return;
+    }
+
+    const interventionNumber = (state?.continueCount || 0) + 1;
+
+    if (interventionNumber >= 3) {
+      showAiNeedBreakOverlay({ focusGoal, aiResult: result, pageContext });
+      return;
+    }
+
+    if (interventionNumber === 2) {
+      showAiStillIntentionalOverlay({ focusGoal, aiResult: result, pageContext });
+      return;
+    }
 
     showAiAwarenessOverlay({
       goal: focusGoal,
-      reason: result.reason || "This content appears unrelated to your focus."
+      reason: result.reason || "This content appears unrelated to your focus.",
+      aiResult: result,
+      pageContext
     });
   }
 
-  function showAiAwarenessOverlay({ goal, reason }) {
+  function showAiAwarenessOverlay({ goal, reason, aiResult, pageContext }) {
     removeAiAwarenessOverlay();
 
     const overlay = document.createElement("div");
@@ -771,7 +1036,7 @@
           ${reason}
         </div>
         <p style="font-size:14px;font-weight:600;">Continue intentionally?</p>
-        <button id="aiContinue">Continue</button>
+        <button id="aiContinue">Continue for 3 min</button>
         <button id="aiLeave">Leave</button>
       </div>
     `;
@@ -780,8 +1045,10 @@
     styleOverlayButtons(overlay);
 
     shadow.getElementById("aiContinue").addEventListener("click", () => {
-      ignoredAiUrls.add(location.href);
+      const url = pageContext?.url || location.href;
+      setAiInterventionCooldown(url, TEMPORARY_APPROVAL_MINUTES, goal || "Focus Session", pageContext);
       overlay.remove();
+      showToast("Continuing intentionally for 3 minutes");
     });
 
     shadow.getElementById("aiLeave").addEventListener("click", () => {
@@ -798,6 +1065,315 @@
 
   function removeAiAwarenessOverlay() {
     const overlay = shadow.getElementById("intenta-ai-awareness-overlay");
+    if (overlay) overlay.remove();
+  }
+
+  async function getGuidedPauseMinutes(minimumMinutes = 1) {
+    const state = await getSessionState();
+    const breakMinutes = Number(state?.breakMinutes) || 10;
+    return Math.max(
+      minimumMinutes,
+      Math.round(Math.max(breakMinutes / 3, breakMinutes / 4))
+    );
+  }
+
+  async function pauseSessionForGuidedBreak(minutes) {
+    await sendMessageWithFallback({ type: "PAUSE_SESSION" });
+    clearIntelligenceState();
+    clearPauseOverlays();
+    renderSessionState();
+    showToast(`Focus session paused for ${minutes} minutes. Enjoy your break.`);
+
+    if (aiAutoResumeTimer) {
+      clearTimeout(aiAutoResumeTimer);
+    }
+
+    aiAutoResumeTimer = setTimeout(async () => {
+      aiAutoResumeTimer = null;
+      await sendMessageWithFallback({ type: "RESUME_SESSION" });
+      renderSessionState();
+      startSessionStateUpdates();
+    }, minutes * 60 * 1000);
+  }
+
+  function setAiInterventionCooldown(url, minutes, focusGoal, pageContext) {
+    const existing = aiInterventionState.get(url) || {
+      continueCount: 0,
+      lastContinueAt: 0
+    };
+    const now = Date.now();
+
+    aiInterventionState.set(url, {
+      ...existing,
+      continueCount: existing.continueCount + 1,
+      lastContinueAt: now,
+      cooldownUntil: now + minutes * 60 * 1000
+    });
+
+    grantTemporaryApproval(url, minutes);
+    scheduleAiInterventionRecheck(url, minutes, focusGoal, pageContext);
+  }
+
+  function scheduleAiInterventionRecheck(url, minutes, focusGoal, pageContext) {
+    if (aiInterventionTimers.has(url)) {
+      clearTimeout(aiInterventionTimers.get(url));
+    }
+
+    const timer = setTimeout(async () => {
+      aiInterventionTimers.delete(url);
+
+      if (!(await shouldRunIntelligence())) return;
+      if (location.href !== url) return;
+
+      requestAiIntentAlignment(focusGoal || "Focus Session", {
+        ...pageContext,
+        url,
+        title: currentYouTubeContext?.title || pageContext?.title || document.title || "",
+        domain: pageContext?.domain || location.hostname
+      });
+    }, minutes * 60 * 1000);
+
+    aiInterventionTimers.set(url, timer);
+  }
+
+  function returnToFocus() {
+    if (detectYouTubePageType() === "SHORTS") {
+      window.history.back();
+      return;
+    }
+
+    window.location.href = "https://www.google.com";
+  }
+
+  function showAiReflectionOverlay({ url, title, focusGoal, aiResult, pageContext }) {
+    removeAiReflectionOverlay();
+
+    const overlay = document.createElement("div");
+    overlay.id = "intenta-ai-reflection-overlay";
+
+    overlay.style = `
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.72);
+      z-index: 2147483647;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      animation: intentaOverlayFadeIn 180ms ease-out;
+    `;
+
+    const reasons = [
+      "Intentional break",
+      "Needed for my work",
+      "Just curious",
+      "I got distracted",
+      "Skip"
+    ];
+
+    overlay.innerHTML = `
+      <div style="
+        width: calc(100% - 32px);
+        max-width: 390px;
+        background: #111;
+        color: white;
+        padding: 24px;
+        border-radius: 16px;
+        text-align: left;
+        line-height: 1.45;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        box-shadow: 0 20px 50px rgba(0,0,0,0.4);
+      ">
+        <div style="text-align:center;">
+          <p style="font-size:20px;font-weight:700;">Quick check</p>
+          <p style="font-size:14px;opacity:0.82;margin-top:6px;">Why are you continuing?</p>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:8px;">
+          ${reasons.map((reason, index) => `
+            <label style="
+              display:flex;
+              align-items:center;
+              gap:8px;
+              background:#181818;
+              border:1px solid #333;
+              border-radius:10px;
+              padding:10px;
+              cursor:pointer;
+              font-size:14px;
+            ">
+              <input
+                type="radio"
+                name="aiReflectionReason"
+                value="${reason}"
+                ${index === 4 ? "checked" : ""}
+                style="appearance:auto;width:auto;accent-color:#22c55e;"
+              />
+              <span>${reason}</span>
+            </label>
+          `).join("")}
+        </div>
+        <button id="aiReflectionContinue">Continue</button>
+      </div>
+    `;
+
+    shadow.appendChild(overlay);
+    styleOverlayButtons(overlay);
+
+    shadow.getElementById("aiReflectionContinue").addEventListener("click", async () => {
+      const selected = shadow.querySelector("input[name='aiReflectionReason']:checked");
+      const selectedReason = selected?.value || "Skip";
+
+      safeSendMessage({
+        type: "SAVE_AI_REFLECTION",
+        data: {
+          url,
+          title,
+          focusGoal,
+          reason: selectedReason,
+          aiAlignment: aiResult?.alignment,
+          aiConfidence: aiResult?.confidence,
+          aiReason: aiResult?.reason,
+          timestamp: Date.now()
+        }
+      });
+
+      overlay.remove();
+
+      if (selectedReason === "Intentional break") {
+        const pauseMinutes = await getGuidedPauseMinutes(1);
+        setAiInterventionCooldown(url, pauseMinutes, focusGoal, pageContext);
+        await pauseSessionForGuidedBreak(pauseMinutes);
+        return;
+      }
+
+      const cooldownMinutes = selectedReason === "Needed for my work" ? 15 : 3;
+      setAiInterventionCooldown(url, cooldownMinutes, focusGoal, pageContext);
+    });
+  }
+
+  function removeAiReflectionOverlay() {
+    const overlay = shadow.getElementById("intenta-ai-reflection-overlay");
+    if (overlay) overlay.remove();
+  }
+
+  function showAiStillIntentionalOverlay({ focusGoal, aiResult, pageContext }) {
+    removeAiFollowupOverlay();
+
+    const overlay = document.createElement("div");
+    overlay.id = "intenta-ai-followup-overlay";
+
+    overlay.style = `
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.72);
+      z-index: 2147483647;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      animation: intentaOverlayFadeIn 180ms ease-out;
+    `;
+
+    overlay.innerHTML = `
+      <div style="
+        width: calc(100% - 32px);
+        max-width: 390px;
+        background: #111;
+        color: white;
+        padding: 24px;
+        border-radius: 16px;
+        text-align: center;
+        line-height: 1.45;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        box-shadow: 0 20px 50px rgba(0,0,0,0.4);
+      ">
+        <p style="font-size:20px;font-weight:700;">Still intentional?</p>
+        <p style="font-size:14px;opacity:0.82;">You've been on this content for a while.</p>
+        <button id="aiStillContinue">Continue</button>
+        <button id="aiReturnFocus">Return to Focus</button>
+      </div>
+    `;
+
+    shadow.appendChild(overlay);
+    styleOverlayButtons(overlay);
+
+    shadow.getElementById("aiStillContinue").addEventListener("click", () => {
+      setAiInterventionCooldown(location.href, 5, focusGoal, pageContext);
+      overlay.remove();
+    });
+
+    shadow.getElementById("aiReturnFocus").addEventListener("click", () => {
+      overlay.remove();
+      returnToFocus();
+    });
+  }
+
+  function showAiNeedBreakOverlay({ focusGoal, aiResult, pageContext }) {
+    removeAiFollowupOverlay();
+
+    const overlay = document.createElement("div");
+    overlay.id = "intenta-ai-followup-overlay";
+
+    overlay.style = `
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.72);
+      z-index: 2147483647;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      animation: intentaOverlayFadeIn 180ms ease-out;
+    `;
+
+    overlay.innerHTML = `
+      <div style="
+        width: calc(100% - 32px);
+        max-width: 410px;
+        background: #111;
+        color: white;
+        padding: 24px;
+        border-radius: 16px;
+        text-align: center;
+        line-height: 1.45;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        box-shadow: 0 20px 50px rgba(0,0,0,0.4);
+      ">
+        <p style="font-size:20px;font-weight:700;">Need a break?</p>
+        <p style="font-size:14px;opacity:0.82;">You've continued this distraction multiple times.</p>
+        <p style="font-size:14px;opacity:0.82;">Maybe a short break would help.</p>
+        <button id="aiPauseSession">Pause Session</button>
+        <button id="aiContinueAnyway">Continue Anyway</button>
+        <button id="aiReturnFocus">Return to Focus</button>
+      </div>
+    `;
+
+    shadow.appendChild(overlay);
+    styleOverlayButtons(overlay);
+
+    shadow.getElementById("aiPauseSession").addEventListener("click", async () => {
+      const pauseMinutes = await getGuidedPauseMinutes(2);
+      setAiInterventionCooldown(location.href, pauseMinutes, focusGoal, pageContext);
+      overlay.remove();
+      await pauseSessionForGuidedBreak(pauseMinutes);
+    });
+
+    shadow.getElementById("aiContinueAnyway").addEventListener("click", () => {
+      setAiInterventionCooldown(location.href, 5, focusGoal, pageContext);
+      overlay.remove();
+    });
+
+    shadow.getElementById("aiReturnFocus").addEventListener("click", () => {
+      overlay.remove();
+      returnToFocus();
+    });
+  }
+
+  function removeAiFollowupOverlay() {
+    const overlay = shadow.getElementById("intenta-ai-followup-overlay");
     if (overlay) overlay.remove();
   }
 
@@ -1029,11 +1605,35 @@
     }
 
     if (message.type === "REALTIME_BLOCK") {
+      if (hasTemporaryApproval()) {
+        removeBlockedOverlay();
+        return;
+      }
       showBlockedOverlay();
     }
 
     if (message.type === "CLEAR_OVERLAYS") {
       clearIntentaOverlays();
+    }
+
+    if (message.type === "SESSION_STARTED") {
+      resetAiRuntimeState();
+      refreshAwarenessForActiveTab();
+    }
+
+    if (message.type === "SESSION_STOPPED") {
+      resetAiRuntimeState();
+      clearIntelligenceState();
+    }
+
+    if (message.type === "SESSION_COMPLETED") {
+      resetAiRuntimeState();
+      clearIntelligenceState();
+    }
+
+    if (message.type === "SESSION_STATE_UPDATED") {
+      console.log("Intenta: received session update");
+      refreshAwarenessForActiveTab();
     }
 
     if (message.type === "SESSION_COMPLETE") {
@@ -1047,6 +1647,18 @@
     }
   });
 
+  document.addEventListener("visibilitychange", async () => {
+    if (document.hidden) return;
+
+    console.log("Intenta: tab became visible");
+    await refreshAwarenessForActiveTab();
+  });
+
+  window.addEventListener("focus", async () => {
+    console.log("Intenta: window focused");
+    await refreshAwarenessForActiveTab();
+  });
+
   const pageData = {
     title: document.title,
     url: window.location.href
@@ -1058,19 +1670,89 @@
       if (!response) return;
 
       if (response.action === "BLOCK") {
+        if (hasTemporaryApproval()) {
+          removeBlockedOverlay();
+          return;
+        }
         showBlockedOverlay();
       }
     }
   );
 
+  async function refreshAwarenessForActiveTab() {
+    const now = Date.now();
+
+    if (awarenessRefreshPromise && now - lastAwarenessRefreshAt < 500) {
+      return awarenessRefreshPromise;
+    }
+
+    lastAwarenessRefreshAt = now;
+    awarenessRefreshPromise = (async () => {
+      console.log("Intenta: tab activated");
+      console.log("Intenta: refreshing awareness");
+      await refreshSessionWidget();
+      console.log("Intenta: rechecking page relevance");
+      await runPageAwarenessIfFocus();
+    })().finally(() => {
+      awarenessRefreshPromise = null;
+    });
+
+    return awarenessRefreshPromise;
+  }
+
+  async function refreshSessionWidget() {
+    const state = await sendMessageWithFallback({ type: "GET_SESSION_STATE" }, 500);
+    if (state) {
+      renderPanel(state);
+    }
+    refreshCurrentPageBlockingState();
+    startSessionStateUpdates();
+  }
+
+  function refreshCurrentPageBlockingState() {
+    safeSendMessage(
+      {
+        type: "PAGE_DATA",
+        data: {
+          title: document.title,
+          url: window.location.href
+        }
+      },
+      (response) => {
+        if (!response) return;
+
+        if (response.action === "BLOCK") {
+          if (hasTemporaryApproval()) {
+            removeBlockedOverlay();
+            return;
+          }
+          showBlockedOverlay();
+        } else {
+          removeBlockedOverlay();
+        }
+      }
+    );
+  }
+
   function showBlockedOverlay() {
+    if (hasTemporaryApproval()) {
+      removeBlockedOverlay();
+      return;
+    }
+
     safeSendMessage({ type: "GET_SESSION_STATE" }, (state) => {
       if (!state?.active || state.mode !== "FOCUS") return;
+      if (hasTemporaryApproval()) {
+        removeBlockedOverlay();
+        return;
+      }
       renderBlockedOverlay();
     });
   }
 
   function renderBlockedOverlay() {
+    if (hasTemporaryApproval()) return;
+
     const existing = shadow.getElementById("intenta-block-overlay");
     if (existing) return;
 
@@ -1218,6 +1900,7 @@
     panel.innerHTML = `
       <div id="sessionStatus">
         <div id="goalText" style="font-weight: 600;">Goal: --</div>
+        <div id="aiStatusText" style="font-size: 12px; opacity: 0.75; display:none;">AI Guidance: --</div>
         <div id="cycleText" style="font-weight: 600;">Cycle: -- / --</div>
         <div id="modeText" style="font-weight: 600;">Mode: IDLE</div>
         <div id="pausedFromText" style="font-size: 12px; opacity: 0.75; display:none;">Paused from: --</div>
@@ -1250,26 +1933,14 @@
     });
 
     withButtonFeedback(shadow.getElementById("start"), async () => {
-      resetAiAwarenessMemory();
-      clearIntelligenceState();
       const focusGoal = shadow.getElementById("focusGoal").value.trim();
-      lastFocusGoalInput = focusGoal;
-      const cycles = Number(shadow.getElementById("cycles").value);
-      const focus = Number(shadow.getElementById("focusTime").value);
-      const breakTime = Number(shadow.getElementById("breakTime").value);
 
-      await sendMessageWithFallback({
-        type: "START_SESSION",
-        data: {
-          focus,
-          break: breakTime,
-          cycles,
-          focusGoal
-        }
-      });
+      if (!focusGoal) {
+        showStartWithoutAiModal();
+        return false;
+      }
 
-      renderSessionState();
-      startSessionStateUpdates();
+      await startSessionFromPanel(true);
     }, "Session started");
 
     withButtonFeedback(shadow.getElementById("stop"), async () => {
@@ -1288,6 +1959,11 @@
     }, "Session paused");
 
     withButtonFeedback(shadow.getElementById("resume"), async () => {
+      if (aiAutoResumeTimer) {
+        clearTimeout(aiAutoResumeTimer);
+        aiAutoResumeTimer = null;
+      }
+
       await sendMessageWithFallback({ type: "RESUME_SESSION" });
       renderSessionState();
       startSessionStateUpdates();
@@ -1310,6 +1986,104 @@
 
     renderSessionState();
     startSessionStateUpdates();
+  }
+
+  async function startSessionFromPanel(aiEnabled) {
+    resetAiAwarenessMemory();
+    clearIntelligenceState();
+
+    const focusGoal = shadow.getElementById("focusGoal")?.value.trim() || "";
+    lastFocusGoalInput = focusGoal;
+    const cycles = Number(shadow.getElementById("cycles")?.value);
+    const focus = Number(shadow.getElementById("focusTime")?.value);
+    const breakTime = Number(shadow.getElementById("breakTime")?.value);
+
+    await sendMessageWithFallback({
+      type: "START_SESSION",
+      data: {
+        focus,
+        break: breakTime,
+        cycles,
+        focusGoal,
+        aiEnabled
+      }
+    });
+
+    renderSessionState();
+    startSessionStateUpdates();
+  }
+
+  function showStartWithoutAiModal() {
+    const existing = shadow.getElementById("intenta-ai-goal-modal");
+    if (existing) existing.remove();
+
+    const overlay = document.createElement("div");
+    overlay.id = "intenta-ai-goal-modal";
+    overlay.className = "intenta-overlay";
+
+    overlay.style = `
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.76);
+      z-index: 2147483647;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      animation: intentaOverlayFadeIn 180ms ease-out;
+    `;
+
+    overlay.innerHTML = `
+      <div style="
+        width: calc(100% - 32px);
+        max-width: 430px;
+        background: #111;
+        color: white;
+        padding: 24px;
+        border-radius: 16px;
+        text-align: left;
+        line-height: 1.45;
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+        box-shadow: 0 20px 50px rgba(0,0,0,0.4);
+      ">
+        <div style="text-align:center;">
+          <p style="font-size:20px;font-weight:700;">Start without a focus goal?</p>
+        </div>
+        <p style="font-size:14px;opacity:0.85;">
+          A focus goal helps Intenta understand which websites support your work and which ones may distract you.
+        </p>
+        <div style="font-size:14px;opacity:0.85;display:flex;flex-direction:column;gap:6px;">
+          <div>Without a goal:</div>
+          <div>• AI guidance will be disabled</div>
+          <div>• Smart relevance detection will be disabled</div>
+          <div>• Reflection prompts will be disabled</div>
+        </div>
+        <div style="font-size:14px;opacity:0.85;display:flex;flex-direction:column;gap:6px;">
+          <div>You can still use:</div>
+          <div>✓ Focus timer</div>
+          <div>✓ Break timer</div>
+          <div>✓ Allowed tabs</div>
+          <div>✓ Session history</div>
+        </div>
+        <button id="continueWithoutAi">Continue without AI</button>
+        <button id="goBackToGoal">Go back</button>
+      </div>
+    `;
+
+    shadow.appendChild(overlay);
+    styleOverlayButtons(overlay);
+
+    shadow.getElementById("continueWithoutAi").addEventListener("click", async () => {
+      overlay.remove();
+      await startSessionFromPanel(false);
+      showToast("Session started");
+    });
+
+    shadow.getElementById("goBackToGoal").addEventListener("click", () => {
+      overlay.remove();
+      shadow.getElementById("focusGoal")?.focus();
+    });
   }
 
   function stylePanelControls(panel) {
@@ -1376,6 +2150,13 @@
     const ytDistractionLeave = container.querySelector("#ytDistractionLeave");
     const aiContinue = container.querySelector("#aiContinue");
     const aiLeave = container.querySelector("#aiLeave");
+    const aiReflectionContinue = container.querySelector("#aiReflectionContinue");
+    const aiStillContinue = container.querySelector("#aiStillContinue");
+    const aiReturnFocus = container.querySelector("#aiReturnFocus");
+    const aiPauseSession = container.querySelector("#aiPauseSession");
+    const aiContinueAnyway = container.querySelector("#aiContinueAnyway");
+    const continueWithoutAi = container.querySelector("#continueWithoutAi");
+    const goBackToGoal = container.querySelector("#goBackToGoal");
 
     if (add) add.style.cssText = `${buttonBaseStyle} background: #22c55e; color: white;`;
     if (back) back.style.cssText = `${buttonBaseStyle} background: #222; color: white;`;
@@ -1390,6 +2171,13 @@
     if (ytDistractionLeave) ytDistractionLeave.style.cssText = `${buttonBaseStyle} background: #ef4444; color: white;`;
     if (aiContinue) aiContinue.style.cssText = `${buttonBaseStyle} background: #22c55e; color: white;`;
     if (aiLeave) aiLeave.style.cssText = `${buttonBaseStyle} background: #ef4444; color: white;`;
+    if (aiReflectionContinue) aiReflectionContinue.style.cssText = `${buttonBaseStyle} background: #22c55e; color: white;`;
+    if (aiStillContinue) aiStillContinue.style.cssText = `${buttonBaseStyle} background: #22c55e; color: white;`;
+    if (aiReturnFocus) aiReturnFocus.style.cssText = `${buttonBaseStyle} background: #ef4444; color: white;`;
+    if (aiPauseSession) aiPauseSession.style.cssText = `${buttonBaseStyle} background: #f59e0b; color: white;`;
+    if (aiContinueAnyway) aiContinueAnyway.style.cssText = `${buttonBaseStyle} background: #222; color: white;`;
+    if (continueWithoutAi) continueWithoutAi.style.cssText = `${buttonBaseStyle} background: #22c55e; color: white;`;
+    if (goBackToGoal) goBackToGoal.style.cssText = `${buttonBaseStyle} background: #222; color: white;`;
   }
 
   function startSessionStateUpdates() {
@@ -1408,79 +2196,110 @@
   function renderSessionState() {
     safeSendMessage({ type: "GET_SESSION_STATE" }, (state) => {
       if (!state) return;
-
-      const cycleText = shadow.getElementById("cycleText");
-      const goalText = shadow.getElementById("goalText");
-      const modeText = shadow.getElementById("modeText");
-      const pausedFromText = shadow.getElementById("pausedFromText");
-      const timeText = shadow.getElementById("timeText");
-      const totalText = shadow.getElementById("totalText");
-      const config = shadow.getElementById("session-config");
-      const start = shadow.getElementById("start");
-      const pause = shadow.getElementById("pause");
-      const resume = shadow.getElementById("resume");
-      const stop = shadow.getElementById("stop");
-      const tabs = shadow.getElementById("tabs");
-      const history = shadow.getElementById("historyBtn");
-      const badge = shadow.getElementById("intenta-timer-badge");
-      const isActive = Boolean(state && state.active);
-      const isFocus = isActive && state.mode === "FOCUS";
-      const isPaused = isActive && state.paused;
-      const mode = isActive ? state.mode : "IDLE";
-      const remaining = format(state.remaining);
-      const totalRemaining = formatLong(state.totalRemaining || 0);
-
-      if (state.focusGoal) {
-        lastFocusGoalInput = state.focusGoal;
-      }
-
-      if (goalText) {
-        goalText.innerText = isActive && state.focusGoal
-          ? `Goal: ${state.focusGoal}`
-          : "Goal: --";
-      }
-      if (cycleText) {
-        cycleText.innerText = isActive
-          ? `Cycle: ${state.currentCycle} / ${state.totalCycles}`
-          : "Cycle: -- / --";
-      }
-      if (modeText) modeText.innerText = "Mode: " + mode;
-      if (pausedFromText) {
-        pausedFromText.innerText = `Paused from: ${state.previousModeBeforePause || "FOCUS"}`;
-        pausedFromText.style.display = isPaused ? "block" : "none";
-      }
-      if (timeText) timeText.innerText = "Remaining: " + remaining;
-      if (totalText) totalText.innerText = "Total left: " + totalRemaining;
-
-      if (!isActive || state.mode === "BREAK" || isPaused) removeBlockedOverlay();
-      if (isFocus) {
-        runYouTubeAwarenessIfFocus();
-      } else {
-        clearIntelligenceState();
-      }
-
-      if (config) config.style.display = isActive ? "none" : "flex";
-      if (start) start.style.display = isActive ? "none" : "block";
-      if (pause) pause.style.display = isActive && !isPaused ? "block" : "none";
-      if (resume) resume.style.display = isPaused ? "block" : "none";
-      if (stop) stop.style.display = isActive ? "block" : "none";
-      if (tabs) tabs.style.display = isFocus ? "block" : "none";
-      if (history) history.style.display = isActive ? "none" : "block";
-
-      if (badge) {
-        if (isActive) {
-          badge.innerText = `${state.mode} ${remaining}`;
-          badge.style.background = isPaused
-            ? "#6b7280"
-            : state.mode === "BREAK"
-              ? "#2563eb"
-              : "#16a34a";
-          badge.style.display = "block";
-        } else {
-          badge.style.display = "none";
-        }
-      }
+      renderPanel(state);
     });
+  }
+
+  function hideAllSessionControls() {
+    [
+      "session-config",
+      "start",
+      "pause",
+      "resume",
+      "stop",
+      "tabs",
+      "historyBtn"
+    ].forEach((id) => {
+      const el = shadow.getElementById(id);
+      if (el) el.style.display = "none";
+    });
+  }
+
+  function renderPanel(state) {
+    const cycleText = shadow.getElementById("cycleText");
+    const goalText = shadow.getElementById("goalText");
+    const aiStatusText = shadow.getElementById("aiStatusText");
+    const modeText = shadow.getElementById("modeText");
+    const pausedFromText = shadow.getElementById("pausedFromText");
+    const timeText = shadow.getElementById("timeText");
+    const totalText = shadow.getElementById("totalText");
+    const config = shadow.getElementById("session-config");
+    const start = shadow.getElementById("start");
+    const pause = shadow.getElementById("pause");
+    const resume = shadow.getElementById("resume");
+    const stop = shadow.getElementById("stop");
+    const tabs = shadow.getElementById("tabs");
+    const history = shadow.getElementById("historyBtn");
+    const badge = shadow.getElementById("intenta-timer-badge");
+    const isActive = Boolean(state && state.active);
+    const isPaused = isActive && (state.paused || state.mode === "PAUSED");
+    const isFocus = isActive && state.mode === "FOCUS" && !isPaused;
+    const isBreak = isActive && state.mode === "BREAK" && !isPaused;
+    const mode = isActive ? state.mode : "IDLE";
+    const remaining = format(state?.remaining || 0);
+    const totalRemaining = formatLong(state?.totalRemaining || 0);
+
+    hideAllSessionControls();
+
+    if (state?.focusGoal) {
+      lastFocusGoalInput = state.focusGoal;
+    }
+
+    if (goalText) {
+      goalText.innerText = isActive && state.focusGoal
+        ? `Goal: ${state.focusGoal}`
+        : "Goal: --";
+    }
+    if (aiStatusText) {
+      aiStatusText.innerText = `AI Guidance: ${state?.aiEnabled ? "ON" : "OFF"}`;
+      aiStatusText.style.display = isActive ? "block" : "none";
+    }
+    if (cycleText) {
+      cycleText.innerText = isActive
+        ? `Cycle: ${state.currentCycle} / ${state.totalCycles}`
+        : "Cycle: -- / --";
+    }
+    if (modeText) modeText.innerText = "Mode: " + mode;
+    if (pausedFromText) {
+      pausedFromText.innerText = `Paused from: ${state?.previousModeBeforePause || "FOCUS"}`;
+      pausedFromText.style.display = isPaused ? "block" : "none";
+    }
+    if (timeText) timeText.innerText = "Remaining: " + remaining;
+    if (totalText) totalText.innerText = "Total left: " + totalRemaining;
+
+    if (!isActive || isBreak || isPaused) removeBlockedOverlay();
+    if (isFocus) {
+      runPageAwarenessIfFocus();
+    } else {
+      clearIntelligenceState();
+    }
+
+    if (!isActive) {
+      if (config) config.style.display = "flex";
+      if (start) start.style.display = "block";
+      if (history) history.style.display = "block";
+    } else if (isPaused) {
+      if (resume) resume.style.display = "block";
+      if (stop) stop.style.display = "block";
+    } else if (isFocus || isBreak) {
+      if (pause) pause.style.display = "block";
+      if (stop) stop.style.display = "block";
+      if (tabs) tabs.style.display = isFocus ? "block" : "none";
+    }
+
+    if (badge) {
+      if (isActive) {
+        badge.innerText = `${mode} ${remaining}`;
+        badge.style.background = isPaused
+          ? "#6b7280"
+          : isBreak
+            ? "#2563eb"
+            : "#16a34a";
+        badge.style.display = "block";
+      } else {
+        badge.style.display = "none";
+      }
+    }
   }
 
   function removeBlockedOverlay() {
@@ -1496,6 +2315,9 @@
       "#intenta-youtube-overlay",
       "#intenta-distraction-overlay",
       "#intenta-ai-awareness-overlay",
+      "#intenta-ai-reflection-overlay",
+      "#intenta-ai-followup-overlay",
+      "#intenta-ai-goal-modal",
       "#intenta-celebration-overlay",
       "#intenta-history-modal",
       "#intenta-panel",
@@ -1530,6 +2352,9 @@
       "#intenta-youtube-overlay",
       "#intenta-distraction-overlay",
       "#intenta-ai-awareness-overlay",
+      "#intenta-ai-reflection-overlay",
+      "#intenta-ai-followup-overlay",
+      "#intenta-ai-goal-modal",
       "#intenta-celebration-overlay",
       "#intenta-history-modal",
       "#intenta-toast"
@@ -1558,6 +2383,7 @@
   function getHistoryCardHtml(item) {
     const isStoppedEarly = item.status === "STOPPED_EARLY";
     const statusText = isStoppedEarly ? "🟡 Stopped Early" : "🟢 Completed";
+    const quality = item.focusQuality || {};
     const completedCycles = isStoppedEarly
       ? item.completedCycles || 0
       : item.cyclesCompleted || 0;
@@ -1576,10 +2402,13 @@
         gap: 6px;
       ">
         <div style="font-weight:700;">${statusText}</div>
-        ${item.focusGoal ? `<div style="font-size:12px;opacity:0.75;">Goal: ${item.focusGoal}</div>` : ""}
+        <div style="font-size:12px;opacity:0.75;">Goal: ${item.focusGoal || "—"}</div>
+        <div style="font-size:12px;opacity:0.75;">AI: ${item.aiEnabled === false ? "OFF" : "ON"}</div>
         <div style="font-size:13px;">Cycles: ${completedCycles} / ${item.totalCycles || 0}</div>
         <div style="font-size:13px;">${focusLine}</div>
+        ${item.aiEnabled === false ? "" : `<div style="font-size:12px;opacity:0.75;">Aligned: ${formatQualityMinutes(quality.alignedMinutes)} • Unrelated continued: ${formatQualityMinutes(getUnrelatedContinuedMinutes(quality))}</div>`}
         <div style="font-size:12px;opacity:0.75;">Closed: ${item.distractionsClosed || 0} • Added: ${item.sitesAdded || 0}</div>
+        ${item.aiEnabled === false ? "" : `<div style="font-size:12px;opacity:0.75;">AI reflections: ${item.aiReflectionsCount || item.aiReflections?.length || 0}</div>`}
         <div style="font-size:12px;opacity:0.6;">${formatHistoryDate(item.completedAt)}</div>
       </div>
     `;
@@ -1661,9 +2490,21 @@
     });
   }
 
+  function formatQualityMinutes(value) {
+    const minutes = Number(value) || 0;
+    return `${minutes % 1 === 0 ? minutes : minutes.toFixed(1)} min`;
+  }
+
+  function getUnrelatedContinuedMinutes(quality = {}) {
+    return (Number(quality.intentionalContinueMinutes) || 0) +
+      (Number(quality.distractedContinueMinutes) || 0);
+  }
+
   function showCelebrationOverlay(summary = {}) {
     const existing = shadow.getElementById("intenta-celebration-overlay");
     if (existing) existing.remove();
+    const quality = summary.focusQuality || {};
+    const unrelatedContinued = getUnrelatedContinuedMinutes(quality);
 
     const overlay = document.createElement("div");
     overlay.id = "intenta-celebration-overlay";
@@ -1710,13 +2551,34 @@
           text-align: left;
           font-size: 14px;
         ">
-          <div><strong>Goal:</strong> ${summary.focusGoal || "Not set"}</div>
+          <div><strong>Goal:</strong> ${summary.focusGoal || "—"}</div>
           <div><strong>Cycles:</strong> ${summary.cyclesCompleted || 0}/${summary.totalCycles || 0}</div>
           <div><strong>Focus time:</strong> ${summary.focusTimeFormatted || `${summary.focusMinutes || 0} min`}</div>
           <div><strong>Break time:</strong> ${summary.breakTimeFormatted || `${summary.breakMinutes || 0} min`}</div>
           <div><strong>Distractions closed:</strong> ${summary.distractionsClosed || 0}</div>
           <div><strong>Sites added to focus:</strong> ${summary.sitesAdded || 0}</div>
+          <div><strong>AI Guidance:</strong> ${summary.aiEnabled === false ? "Disabled" : "Enabled"}</div>
+          ${summary.aiEnabled === false ? "" : `<div><strong>AI reflections:</strong> ${summary.aiReflectionsCount || summary.aiReflections?.length || 0}</div>`}
         </div>
+        ${summary.aiEnabled === false ? "" : `<div style="
+          width: 100%;
+          background: #181818;
+          border: 1px solid #333;
+          border-radius: 12px;
+          padding: 14px;
+          display: flex;
+          flex-direction: column;
+          gap: 8px;
+          text-align: left;
+          font-size: 14px;
+        ">
+          <div><strong>Focus quality:</strong></div>
+          <div>Aligned: ${formatQualityMinutes(quality.alignedMinutes)}</div>
+          <div>Possibly related: ${formatQualityMinutes(quality.possiblyRelatedMinutes)}</div>
+          <div>Background: ${formatQualityMinutes(quality.backgroundMinutes)}</div>
+          <div>Unrelated continued: ${formatQualityMinutes(unrelatedContinued)}</div>
+          ${unrelatedContinued > 0 ? `<div style="font-size:12px;opacity:0.75;">Reflection: You continued unrelated content for ${formatQualityMinutes(unrelatedContinued)}.</div>` : ""}
+        </div>`}
         <button id="intenta-celebration-done">Done</button>
       </div>
     `;
