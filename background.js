@@ -1,3 +1,9 @@
+try {
+  importScripts("config.js");
+} catch (error) {
+  console.warn("Intenta config.js not loaded; AI backend config may be missing.");
+}
+
 console.log("Intenta background running");
 
 let session = {
@@ -28,6 +34,9 @@ const DEFAULT_FOCUS_MINUTES = 50;
 const DEFAULT_BREAK_MINUTES = 10;
 const DEFAULT_CYCLES = 3;
 const SESSION_STATE_KEY = "sessionState";
+const AI_BACKEND_URL = globalThis.INTENTA_CONFIG?.AI_BACKEND_URL;
+const INTENTA_BETA_KEY = globalThis.INTENTA_CONFIG?.BETA_KEY;
+const BETA_KEY_PLACEHOLDER = "PASTE_BETA_KEY_HERE";
 
 chrome.storage.local.get([SESSION_STATE_KEY], (result) => {
   if (result.sessionState) {
@@ -857,18 +866,39 @@ async function classifyIntentWithBackend(data = {}) {
     };
   }
 
-  const response = await fetch("http://localhost:3001/classify-intent", {
+  if (!AI_BACKEND_URL) {
+    console.warn("Intenta backend URL is not configured.");
+    return {
+      alignment: "UNCLEAR",
+      confidence: 0,
+      reason: "Intenta backend URL is not configured."
+    };
+  }
+
+  if (!INTENTA_BETA_KEY || INTENTA_BETA_KEY === BETA_KEY_PLACEHOLDER) {
+    console.warn("Intenta beta key is not configured.");
+    return {
+      alignment: "UNCLEAR",
+      confidence: 0,
+      reason: "Intenta beta key is not configured."
+    };
+  }
+
+  const payload = {
+    focusGoal: data.focusGoal || session.focusGoal || "Focus Session",
+    pageType: data.pageType || "UNKNOWN",
+    title: data.title || "",
+    url: data.url || "",
+    domain: data.domain || ""
+  };
+
+  const response = await fetch(AI_BACKEND_URL, {
     method: "POST",
     headers: {
-      "Content-Type": "application/json"
+      "Content-Type": "application/json",
+      "X-Intenta-Beta-Key": INTENTA_BETA_KEY
     },
-    body: JSON.stringify({
-      focusGoal: data.focusGoal || session.focusGoal || "Focus Session",
-      pageType: data.pageType || "UNKNOWN",
-      title: data.title || "",
-      url: data.url || "",
-      domain: data.domain || ""
-    })
+    body: JSON.stringify(payload)
   });
 
   if (!response.ok) {
